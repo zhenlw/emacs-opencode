@@ -194,7 +194,7 @@
     (should (equal (substring-no-properties
                     (opencode-session--render-message-part
                      (opencode-message-create :role "assistant") part))
-                   "→ Read src/main.el\n↳ Loaded AGENTS.md\n↳ Loaded src/CLAUDE.md"))))
+                   "→ Read src/main.el ▸\n↳ Loaded AGENTS.md\n↳ Loaded src/CLAUDE.md"))))
 
 (ert-deftest test-opencode-render/read-hides-loaded-instructions-when-compacted ()
   "Do not render loaded instruction files from compacted read parts."
@@ -312,12 +312,172 @@
                  '((todos . [((status . "completed") (content . "done"))])))))
     (should (= (length result) 1))))
 
-;;; collapse-symbol
+;;; tool output drawer
 
-(ert-deftest test-opencode-render/collapse-symbol ()
-  "Generate a unique collapse symbol."
-  (should (eq (opencode-session--collapse-symbol "abc123")
-              'opencode-collapse-abc123)))
+(defun opencode-render-test--tool-part (id tool status &rest state)
+  "Build a tool part with ID, TOOL, STATUS, and extra STATE pairs."
+  (opencode-message-part-create
+   :id id
+   :message-id "m1"
+   :type "tool"
+   :tool tool
+   :state (append `((status . ,status)) state)))
+
+(ert-deftest test-opencode-render/tool-drawer-closed-indicator ()
+  "A completed tool renders a closed drawer indicator on its first line."
+  (with-temp-buffer
+    (let* ((part (opencode-render-test--tool-part
+                  "p1" "grep" "completed"
+                  '(input . ((pattern . "needle")))
+                  '(output . "a.el:1:needle")))
+           (text (opencode-session--tool-part-line part)))
+      (should (string-match-p "Grep.*▸$" (car (split-string text "\n"))))
+      (should-not (string-match-p "a\\.el:1:needle" text))
+      (should (equal (get-text-property 0 'opencode-tool-part-id text) "p1"))
+      (should (equal (get-text-property 0 'opencode-tool-message-id text) "m1"))
+      (should (eq (get-text-property 0 'keymap text)
+                  opencode-session--tool-drawer-keymap)))))
+
+(ert-deftest test-opencode-render/tool-drawer-hidden-while-running ()
+  "Tools that have not completed show no drawer indicator or keymap."
+  (with-temp-buffer
+    (let ((text (opencode-session--tool-part-line
+                 (opencode-render-test--tool-part "p1" "grep" "running"))))
+      (should-not (string-match-p "[▸▾]" text))
+      (should-not (get-text-property 0 'keymap text)))))
+
+(ert-deftest test-opencode-render/tool-drawer-open-shows-output ()
+  "An open drawer renders the tool output tagged as tool-output."
+  (with-temp-buffer
+    (opencode-session--set-tool-drawer-open "p1" t)
+    (let* ((part (opencode-render-test--tool-part
+                  "p1" "grep" "completed"
+                  '(output . "\e[31ma.el:1:needle\e[0m\n")))
+           (text (opencode-session--tool-part-line part))
+           (pos (string-match "a\\.el:1:needle" text)))
+      (should (string-match-p "▾$" (car (split-string text "\n"))))
+      (should pos)
+      (should (equal (get-text-property pos 'opencode-part-type text)
+                     "tool-output"))
+      (should-not (string-match-p "\e\\[" text)))))
+
+(ert-deftest test-opencode-render/tool-drawer-open-empty-output ()
+  "An open drawer with empty output shows a placeholder."
+  (with-temp-buffer
+    (opencode-session--set-tool-drawer-open "p1" t)
+    (should (string-match-p
+             "(no output)"
+             (opencode-session--tool-part-line
+              (opencode-render-test--tool-part "p1" "write" "completed"
+                                               '(output . "")))))))
+
+(ert-deftest test-opencode-render/tool-drawer-open-missing-output-loading ()
+  "An open drawer whose output has not been fetched shows a loading line."
+  (with-temp-buffer
+    (opencode-session--set-tool-drawer-open "p1" t)
+    (should (string-match-p
+             "Loading"
+             (opencode-session--tool-part-line
+              (opencode-render-test--tool-part "p1" "read" "completed"))))))
+
+(ert-deftest test-opencode-render/tool-drawer-bash-output-from-metadata ()
+  "Bash keeps its command visible and puts metadata output in the drawer."
+  (with-temp-buffer
+    (let* ((part (opencode-render-test--tool-part
+                  "p1" "bash" "completed"
+                  '(input . ((command . "ls") (description . "list files")))
+                  '(metadata . ((output . "a\nb\nc")))))
+           (closed (opencode-session--tool-part-line part)))
+      (should (string-match-p "^\\$ ls$" closed))
+      (should-not (string-match-p "^a\nb\nc" closed))
+      (opencode-session--set-tool-drawer-open "p1" t)
+      (should (string-match-p "^\\$ ls\na\nb\nc"
+                              (opencode-session--tool-part-line part))))))
+
+(ert-deftest test-opencode-render/tool-drawer-task-keymap ()
+  "Task blocks open the subagent on RET and toggle the drawer on TAB."
+  (should (eq (lookup-key opencode-session--task-keymap (kbd "RET"))
+              #'opencode-session-open-subagent))
+  (should (eq (lookup-key opencode-session--task-keymap (kbd "TAB"))
+              #'opencode-session-toggle-tool-output))
+  (should (eq (lookup-key opencode-session--tool-drawer-keymap (kbd "TAB"))
+              #'opencode-session-toggle-tool-output))
+  (should (eq (lookup-key opencode-session--tool-drawer-keymap (kbd "<tab>"))
+              #'opencode-session-toggle-tool-output)))
+
+(ert-deftest test-opencode-render/tool-drawer-task-keeps-subagent-props ()
+  "A completed task with a subagent keeps its task keymap over the drawer's."
+  (with-temp-buffer
+    (let ((text (opencode-session--tool-part-line
+                 (opencode-render-test--tool-part
+                  "p1" "task" "completed"
+                  '(input . ((description . "explore")))
+                  '(metadata . ((sessionId . "ses_child")))
+                  '(output . "result")))))
+      (should (eq (get-text-property 0 'keymap text)
+                  opencode-session--task-keymap))
+      (should (eq (get-text-property (string-match "▸" text) 'keymap text)
+                  opencode-session--task-keymap))
+      (should (string-match-p "RET" (get-text-property 0 'help-echo text)))
+      (should (equal (get-text-property 0 'opencode-tool-part-id text) "p1")))))
+
+(ert-deftest test-opencode-render/tool-drawer-open-spacing ()
+  "An open drawer keeps its line in place and adds a blank line after its body."
+  (with-temp-buffer
+    (opencode-session--set-tool-drawer-open "p2" t)
+    (let* ((message (opencode-message-create :id "m1" :role "assistant"))
+           (parts (list (cons "p1" (opencode-render-test--tool-part
+                                    "p1" "glob" "completed"))
+                        (cons "p2" (opencode-render-test--tool-part
+                                    "p2" "grep" "completed"
+                                    '(output . "line1\nline2")))
+                        (cons "p3" (opencode-render-test--tool-part
+                                    "p3" "glob" "completed"))
+                        (cons "p4" (opencode-message-part-create
+                                    :id "p4" :type "text" :text "done"))))
+           (text (substring-no-properties
+                  (opencode-session--render-message-parts message parts))))
+      (should (equal text
+                     "✱ Glob ▸\n✱ Grep ▾\nline1\nline2\n\n✱ Glob ▸\ndone\n")))))
+
+(ert-deftest test-opencode-render/tool-drawer-open-last-part-no-trailing-blank ()
+  "An open drawer at the end of a message adds no trailing blank line."
+  (with-temp-buffer
+    (opencode-session--set-tool-drawer-open "p1" t)
+    (let* ((message (opencode-message-create :id "m1" :role "assistant"))
+           (parts (list (cons "p1" (opencode-render-test--tool-part
+                                    "p1" "grep" "completed"
+                                    '(output . "line1")))))
+           (text (substring-no-properties
+                  (opencode-session--render-message-parts message parts))))
+      (should (equal text "✱ Grep ▾\nline1")))))
+
+(ert-deftest test-opencode-render/inline-tools-ending-in-n-stay-on-own-lines ()
+  "A tool line ending in the letter n is still followed by a newline."
+  (with-temp-buffer
+    (let* ((message (opencode-message-create :id "m1" :role "assistant"))
+           (parts (list (cons "p1" (opencode-render-test--tool-part
+                                    "p1" "read" "running"
+                                    '(input . ((filePath . "foo.json")))))
+                        (cons "p2" (opencode-render-test--tool-part
+                                    "p2" "read" "running"
+                                    '(input . ((filePath . "bar.el")))))))
+           (text (substring-no-properties
+                  (opencode-session--render-message-parts message parts))))
+      (should (equal text "→ Read foo.json [running]\n→ Read bar.el [running]")))))
+
+(ert-deftest test-opencode-render/inline-tool-then-block-tool-spacing ()
+  "Closed inline tool lines keep their single-newline spacing before blocks."
+  (with-temp-buffer
+    (let* ((message (opencode-message-create :id "m1" :role "assistant"))
+           (parts (list (cons "p1" (opencode-render-test--tool-part
+                                    "p1" "glob" "completed"))
+                        (cons "p2" (opencode-render-test--tool-part
+                                    "p2" "bash" "completed"
+                                    '(input . ((command . "ls")))))))
+           (text (substring-no-properties
+                  (opencode-session--render-message-parts message parts))))
+      (should (equal text "✱ Glob ▸\n✱ Shell ls ▸\n$ ls\n")))))
 
 ;;; task-current-tool
 

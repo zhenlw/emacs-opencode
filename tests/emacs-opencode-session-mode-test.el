@@ -792,6 +792,179 @@ banner, causing the prompt overlay to render before the banner."
                "first second"
                (buffer-substring-no-properties (point-min) (point-max)))))))
 
+;;; tool output drawer
+
+(defun opencode-session-mode-test--tool-buffer-setup (state)
+  "Prepare the current buffer with one completed grep tool part in STATE.
+Leaves point on the tool summary line."
+  (opencode-session-mode)
+  (setq-local opencode-session--session
+              (opencode-session-create :id "test-session"))
+  (setq-local opencode-session--connection
+              (opencode-connection-create :base-url "http://127.0.0.1:1"))
+  (opencode-session--ensure-markers)
+  (opencode-session--ensure-input-region)
+  (setq-local opencode-session--messages
+              (list (opencode-message-create
+                     :id "m1"
+                     :session-id "test-session"
+                     :role "assistant"
+                     :parts (list (cons "p1"
+                                        (opencode-message-part-create
+                                         :id "p1"
+                                         :session-id "test-session"
+                                         :message-id "m1"
+                                         :type "tool"
+                                         :tool "grep"
+                                         :state state))))))
+  (opencode-session--render-buffer)
+  (goto-char (point-min))
+  (search-forward "Grep"))
+
+(defun opencode-session-mode-test--transcript ()
+  "Return the rendered transcript above the input area."
+  (buffer-substring-no-properties
+   (point-min) (marker-position opencode-session--input-start-marker)))
+
+(ert-deftest test-opencode-session-mode/toggle-tool-output-opens-and-closes ()
+  "TAB on a tool summary shows its output, and again hides it."
+  (with-temp-buffer
+    (opencode-session-mode-test--tool-buffer-setup
+     '((status . "completed")
+       (input . ((pattern . "needle")))
+       (output . "a.el:1:needle")))
+    (should-not (string-match-p "a\\.el:1:needle"
+                                (opencode-session-mode-test--transcript)))
+    (opencode-session-toggle-tool-output)
+    (should (string-match-p "a\\.el:1:needle"
+                            (opencode-session-mode-test--transcript)))
+    (should (string-match-p "Grep" (thing-at-point 'line t)))
+    (opencode-session-toggle-tool-output)
+    (should-not (string-match-p "a\\.el:1:needle"
+                                (opencode-session-mode-test--transcript)))))
+
+(ert-deftest test-opencode-session-mode/toggle-tool-output-survives-rerender ()
+  "An open drawer stays open when the message re-renders."
+  (with-temp-buffer
+    (opencode-session-mode-test--tool-buffer-setup
+     '((status . "completed") (output . "a.el:1:needle")))
+    (opencode-session-toggle-tool-output)
+    (opencode-session--render-message (car opencode-session--messages))
+    (should (string-match-p "a\\.el:1:needle"
+                            (opencode-session-mode-test--transcript)))))
+
+(ert-deftest test-opencode-session-mode/toggle-tool-output-fetches-missing-output ()
+  "Opening a drawer without output fetches the message and fills all parts."
+  (with-temp-buffer
+    (let (captured)
+      (cl-letf (((symbol-function 'opencode-client-session-message)
+                 (lambda (_conn session-id message-id &rest args)
+                   (setq captured (list session-id message-id args)))))
+        (opencode-session-mode-test--tool-buffer-setup
+         '((status . "completed")))
+        (opencode-session-toggle-tool-output)
+        (should (equal (car captured) "test-session"))
+        (should (equal (cadr captured) "m1"))
+        (should (string-match-p "Loading"
+                                (opencode-session-mode-test--transcript)))
+        (funcall (plist-get (nth 2 captured) :success)
+                 :data '((info . ((id . "m1")))
+                         (parts . [((id . "p1")
+                                    (type . "tool")
+                                    (state . ((status . "completed")
+                                              (output . "fetched"))))])))
+        (should (string-match-p "fetched"
+                                (opencode-session-mode-test--transcript)))
+        (should-not (string-match-p "Loading"
+                                    (opencode-session-mode-test--transcript)))))))
+
+(ert-deftest test-opencode-session-mode/toggle-tool-output-fetch-error-closes ()
+  "A failed output fetch closes the drawer instead of leaving it loading."
+  (with-temp-buffer
+    (let (captured)
+      (cl-letf (((symbol-function 'opencode-client-session-message)
+                 (lambda (_conn _session-id _message-id &rest args)
+                   (setq captured args)))
+                ((symbol-function 'message) #'ignore))
+        (opencode-session-mode-test--tool-buffer-setup
+         '((status . "completed")))
+        (opencode-session-toggle-tool-output)
+        (funcall (plist-get captured :error))
+        (should-not (string-match-p "Loading"
+                                    (opencode-session-mode-test--transcript)))
+        (should-not (opencode-session--tool-drawer-open-p "p1"))))))
+
+(ert-deftest test-opencode-session-mode/tool-output-survives-part-update ()
+  "Fetched output is kept when a later part update lacks it."
+  (with-temp-buffer
+    (opencode-session-mode-test--tool-buffer-setup
+     '((status . "completed") (output . "kept")))
+    (opencode-session-toggle-tool-output)
+    (opencode-session--update-message-part
+     '((id . "p1")
+       (sessionID . "test-session")
+       (messageID . "m1")
+       (type . "tool")
+       (tool . "grep")
+       (state . ((status . "completed") (time . ((compacted . 3))))))
+     nil)
+    (should (string-match-p "kept" (opencode-session-mode-test--transcript)))))
+
+(ert-deftest test-opencode-session-mode/tool-output-update-with-output-wins ()
+  "A part update that carries its own output replaces the stored one."
+  (with-temp-buffer
+    (opencode-session-mode-test--tool-buffer-setup
+     '((status . "completed") (output . "old")))
+    (opencode-session-toggle-tool-output)
+    (opencode-session--update-message-part
+     '((id . "p1")
+       (sessionID . "test-session")
+       (messageID . "m1")
+       (type . "tool")
+       (tool . "grep")
+       (state . ((status . "completed") (output . "new"))))
+     nil)
+    (let ((transcript (opencode-session-mode-test--transcript)))
+      (should (string-match-p "new" transcript))
+      (should-not (string-match-p "old" transcript)))))
+
+(ert-deftest test-opencode-session-mode/toggle-tool-output-fetch-without-output ()
+  "A fetched part with no output shows the empty placeholder, not loading."
+  (with-temp-buffer
+    (let (captured)
+      (cl-letf (((symbol-function 'opencode-client-session-message)
+                 (lambda (_conn _session-id _message-id &rest args)
+                   (setq captured args))))
+        (opencode-session-mode-test--tool-buffer-setup
+         '((status . "completed")))
+        (opencode-session-toggle-tool-output)
+        (funcall (plist-get captured :success)
+                 :data '((parts . [((id . "p1")
+                                    (type . "tool")
+                                    (state . ((status . "completed"))))])))
+        (should (string-match-p "(no output)"
+                                (opencode-session-mode-test--transcript)))))))
+
+(ert-deftest test-opencode-session-mode/toggle-tool-output-without-connection ()
+  "Opening a drawer that needs a fetch with no connection leaves it closed."
+  (with-temp-buffer
+    (cl-letf (((symbol-function 'message) #'ignore))
+      (opencode-session-mode-test--tool-buffer-setup '((status . "completed")))
+      (setq-local opencode-session--connection nil)
+      (opencode-session-toggle-tool-output)
+      (should-not (opencode-session--tool-drawer-open-p "p1"))
+      (should-not (string-match-p "Loading"
+                                  (opencode-session-mode-test--transcript))))))
+
+(ert-deftest test-opencode-session-mode/toggle-tool-output-outside-tool ()
+  "Toggling away from a tool part is a no-op."
+  (with-temp-buffer
+    (opencode-session-mode-test--tool-buffer-setup
+     '((status . "completed") (output . "x")))
+    (goto-char (point-max))
+    (opencode-session-toggle-tool-output)
+    (should-not (opencode-session--tool-drawer-open-p "p1"))))
+
 (provide 'emacs-opencode-session-mode-test)
 
 ;;; emacs-opencode-session-mode-test.el ends here

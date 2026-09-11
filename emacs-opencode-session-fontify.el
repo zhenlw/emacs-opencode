@@ -603,6 +603,10 @@ Sets `match-data' group 0 to the matched region."
   "Font-lock matcher for tool output regions up to LIMIT."
   (opencode-session--match-part-type "tool" limit))
 
+(defun opencode-session--match-tool-output (limit)
+  "Font-lock matcher for open tool output drawers up to LIMIT."
+  (opencode-session--match-part-type "tool-output" limit))
+
 (defun opencode-session--match-reasoning-text (limit)
   "Font-lock matcher for reasoning/thinking regions up to LIMIT."
   (opencode-session--match-part-type "reasoning" limit))
@@ -614,6 +618,8 @@ Sets `match-data' group 0 to the matched region."
      (0 'opencode-session-assistant-face))
     (opencode-session--match-tool-text
      (0 'opencode-session-tool-face))
+    (opencode-session--match-tool-output
+     (0 'opencode-session-tool-output-face))
     (opencode-session--match-reasoning-text
      (0 'opencode-session-reasoning-face)))
   "Font-lock keywords that set the base face for tagged regions.")

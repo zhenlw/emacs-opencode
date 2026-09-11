@@ -53,11 +53,25 @@ Initialized from `opencode-session-show-reasoning' when the buffer
 enters `opencode-session-mode', and toggled per-buffer by
 `opencode-session-toggle-reasoning'.")
 
-(defvar-local opencode-session--expanded-collapse-syms nil
-  "Hash table of invisibility symbols the user has manually expanded.
-Keys are symbols of the form `opencode-collapse-<part-id>'.
-When a symbol is present in this table, re-renders will not
-re-collapse the corresponding block.")
+(defvar-local opencode-session--open-tool-drawers nil
+  "Hash table of tool part IDs whose output drawer is open.
+Drawers start closed; re-renders keep any drawer listed here open.")
+
+(defun opencode-session--tool-drawer-open-p (part-id)
+  "Return non-nil when the output drawer for PART-ID is open."
+  (and opencode-session--open-tool-drawers
+       (gethash part-id opencode-session--open-tool-drawers)))
+
+(defun opencode-session--set-tool-drawer-open (part-id open)
+  "Mark the output drawer for PART-ID as OPEN when non-nil, else closed."
+  (if open
+      (progn
+        (unless opencode-session--open-tool-drawers
+          (setq-local opencode-session--open-tool-drawers
+                      (make-hash-table :test 'equal)))
+        (puthash part-id t opencode-session--open-tool-drawers))
+    (when opencode-session--open-tool-drawers
+      (remhash part-id opencode-session--open-tool-drawers))))
 
 (defun opencode-session--buffer-for-session (session-id)
   "Return the session buffer for SESSION-ID, if any."

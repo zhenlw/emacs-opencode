@@ -122,7 +122,7 @@
     (insert (propertize "hello" 'face 'bold))
     (should-not (opencode-session--face-p 1 '(italic)))))
 
-;;; collapse-symbol (tested in render tests but also used in fontify)
+;;; block separator
 
 (ert-deftest test-opencode-fontify/block-separator-regex ()
   "Block separator matches blank lines."

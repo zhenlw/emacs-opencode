@@ -6,6 +6,7 @@
 (require 'emacs-opencode-session-vars)
 (require 'emacs-opencode-message)
 (require 'emacs-opencode-connection)
+(require 'emacs-opencode-client)
 (require 'emacs-opencode-session)
 (require 'emacs-opencode-session-fontify)
 (require 'emacs-opencode-sse-profile)
@@ -57,85 +58,144 @@ deleted on every status update.")
   "Face used for session compaction boundary markers."
   :group 'emacs-opencode)
 
-(defcustom opencode-session-bash-output-max-lines 10
-  "Maximum number of shell output lines to show before collapsing."
-  :type 'integer
+(defface opencode-session-tool-output-face
+  '((t :inherit opencode-session-tool-face))
+  "Face used for tool output shown in an open drawer."
   :group 'emacs-opencode)
 
-;;; Collapse / expand for long tool output
+;;; Tool output drawer
 
-(defvar opencode-session--collapse-keymap
+(declare-function opencode-session--find-message "emacs-opencode-session-mode")
+
+(defvar opencode-session--tool-drawer-keymap
   (let ((map (make-sparse-keymap)))
-    (define-key map (kbd "RET") #'opencode-session-toggle-collapse)
-    (define-key map (kbd "TAB") #'opencode-session-toggle-collapse)
-    (define-key map [mouse-1] #'opencode-session-toggle-collapse)
+    (define-key map (kbd "TAB") #'opencode-session-toggle-tool-output)
+    (define-key map (kbd "<tab>") #'opencode-session-toggle-tool-output)
+    (define-key map [mouse-1] #'opencode-session-toggle-tool-output)
     map)
-  "Keymap for collapsible tool output indicators.")
+  "Keymap for tool summaries whose output can be toggled.")
 
-(defun opencode-session--collapse-symbol (part-id)
-  "Return a unique invisibility symbol for PART-ID."
-  (intern (format "opencode-collapse-%s" part-id)))
+(defun opencode-session--tool-drawer-available-p (part)
+  "Return non-nil when PART is a tool call whose output can be shown."
+  (equal (alist-get 'status (opencode-message-part-state part)) "completed"))
 
-(defun opencode-session-toggle-collapse ()
-  "Toggle collapsed tool output at point."
+(defun opencode-session--tool-output (part)
+  "Return the output text for PART, or nil when it has not been fetched.
+Bash reports its output in metadata, which arrives over SSE; other
+tools only carry output in state, which the SSE bridge strips."
+  (let* ((state (opencode-message-part-state part))
+         (metadata (alist-get 'metadata state))
+         (output (or (alist-get 'output state)
+                     (and (listp metadata) (alist-get 'output metadata)))))
+    (when (stringp output)
+      (opencode-session--strip-ansi (string-trim-right output)))))
+
+(defun opencode-session--tool-drawer-body (part)
+  "Return the drawer body text for an open PART drawer."
+  (let ((output (opencode-session--tool-output part)))
+    (propertize (cond
+                 ((null output) "Loading output...")
+                 ((string-empty-p output) "(no output)")
+                 (t output))
+                'opencode-part-type "tool-output")))
+
+(defun opencode-session--tool-drawer-indicator (text open)
+  "Append a drawer indicator for OPEN state to the first line of TEXT.
+The indicator inherits the text properties of the first line so it
+stays clickable."
+  (let* ((lines (split-string text "\n"))
+         (first (car lines))
+         (props (and (> (length first) 0)
+                     (text-properties-at (1- (length first)) first)))
+         (glyph (apply #'propertize (if open " ▾" " ▸") props)))
+    (string-join (cons (concat first glyph) (cdr lines)) "\n")))
+
+(defun opencode-session--tool-drawer-propertize (text part)
+  "Make TEXT toggle the drawer for PART, keeping any existing keymap."
+  (let ((result (copy-sequence text)))
+    (add-text-properties 0 (length result)
+                         (list 'opencode-tool-part-id (opencode-message-part-id part)
+                               'opencode-tool-message-id (opencode-message-part-message-id part)
+                               'mouse-face 'highlight)
+                         result)
+    (unless (get-text-property 0 'keymap result)
+      (add-text-properties 0 (length result)
+                           (list 'keymap opencode-session--tool-drawer-keymap
+                                 'help-echo "TAB: toggle tool output")
+                           result))
+    result))
+
+(defun opencode-session--find-part (message part-id)
+  "Return the part with PART-ID in MESSAGE, if any."
+  (cdr (assoc part-id (opencode-message-parts message))))
+
+(defun opencode-session-toggle-tool-output ()
+  "Toggle the output drawer for the tool call at point."
   (interactive)
-  (let ((sym (get-text-property (point) 'opencode-collapse-sym)))
-    (when sym
-      (if (memq sym buffer-invisibility-spec)
-          (progn
-            ;; Expanding: remove from spec and remember user choice.
-            (remove-from-invisibility-spec sym)
-            (unless opencode-session--expanded-collapse-syms
-              (setq-local opencode-session--expanded-collapse-syms
-                          (make-hash-table :test 'eq)))
-            (puthash sym t opencode-session--expanded-collapse-syms)
-            (let ((inhibit-read-only t))
-              (opencode-session--update-collapse-indicator (point) t)))
-        ;; Collapsing: add back to spec and forget user expansion.
-        (add-to-invisibility-spec sym)
-        (when opencode-session--expanded-collapse-syms
-          (remhash sym opencode-session--expanded-collapse-syms))
-        (let ((inhibit-read-only t))
-          (opencode-session--update-collapse-indicator (point) nil))))))
+  (let* ((part-id (get-text-property (point) 'opencode-tool-part-id))
+         (message-id (get-text-property (point) 'opencode-tool-message-id))
+         (message (and message-id (opencode-session--find-message message-id)))
+         (part (and message part-id (opencode-session--find-part message part-id))))
+    (when part
+      (let ((open (not (opencode-session--tool-drawer-open-p part-id))))
+        (opencode-session--set-tool-drawer-open part-id open)
+        (opencode-session--render-message message)
+        (when (and open (null (opencode-session--tool-output part)))
+          (opencode-session--fetch-tool-output message part-id))))))
 
-(defun opencode-session--update-collapse-indicator (pos expanded)
-  "Update the collapse indicator text near POS for EXPANDED state."
-  (let* ((sym (get-text-property pos 'opencode-collapse-sym))
-         (count (get-text-property pos 'opencode-collapse-count)))
-    (when (and sym count)
-      (save-excursion
-        ;; Find the indicator line by scanning for matching symbol
-        (goto-char (point-min))
-        (let ((found nil))
-          (while (and (not found) (< (point) (point-max)))
-            (if (eq (get-text-property (point) 'opencode-collapse-indicator) sym)
-                (setq found t)
-              (goto-char (next-single-property-change
-                          (point) 'opencode-collapse-indicator nil (point-max)))))
-          (when found
-            (let* ((line-start (line-beginning-position))
-                   (line-end (line-end-position))
-                   (new-text (if expanded
-                                 "▼ collapse"
-                               (format "▶ %d more lines" count))))
-              (delete-region line-start line-end)
-              (insert (propertize new-text
-                                  'opencode-part-type "tool"
-                                  'opencode-collapse-sym sym
-                                  'opencode-collapse-count count
-                                  'opencode-collapse-indicator sym
-                                  'keymap opencode-session--collapse-keymap
-                                  'mouse-face 'highlight)))))))))
+(defun opencode-session--fetch-tool-output (message part-id)
+  "Fetch full tool output for MESSAGE and re-render it.
+Closes the drawer for PART-ID if the request fails."
+  (let ((buffer (current-buffer))
+        (connection opencode-session--connection)
+        (session-id (and opencode-session--session
+                         (opencode-session-id opencode-session--session))))
+    (if (not (and connection session-id))
+        (progn
+          (message "OpenCode: no connection to load tool output")
+          (opencode-session--set-tool-drawer-open part-id nil)
+          (opencode-session--render-message message))
+      (opencode-client-session-message
+       connection session-id (opencode-message-id message)
+       :success (lambda (&rest args)
+                  (when (buffer-live-p buffer)
+                    (with-current-buffer buffer
+                      (opencode-session--store-tool-outputs
+                       message (alist-get 'parts (plist-get args :data)))
+                      (opencode-session--render-message message))))
+       :error (lambda (&rest _args)
+                (when (buffer-live-p buffer)
+                  (with-current-buffer buffer
+                    (message "OpenCode: failed to load tool output")
+                    (opencode-session--set-tool-drawer-open part-id nil)
+                    (opencode-session--render-message message))))))))
+
+(defun opencode-session--store-tool-outputs (message parts)
+  "Copy tool output from fetched PARTS into the matching parts of MESSAGE.
+Completed parts the server returns without output are stored as empty
+so their drawers stop showing the loading placeholder."
+  (dolist (raw (opencode-session--normalize-items parts))
+    (let* ((state (alist-get 'state raw))
+           (output (alist-get 'output state))
+           (part (opencode-session--find-part message (alist-get 'id raw))))
+      (when (and part
+                 (equal (alist-get 'type raw) "tool")
+                 (equal (alist-get 'status state) "completed"))
+        (setf (opencode-message-part-state part)
+              (cons (cons 'output (if (stringp output) output ""))
+                    (opencode-message-part-state part)))))))
 
 ;;; Task tool interactivity
 
 (defvar opencode-session--task-keymap
   (let ((map (make-sparse-keymap)))
+    (set-keymap-parent map opencode-session--tool-drawer-keymap)
     (define-key map (kbd "RET") #'opencode-session-open-subagent)
-    (define-key map (kbd "TAB") #'opencode-session-open-subagent)
     (define-key map [mouse-1] #'opencode-session-open-subagent)
     map)
-  "Keymap for clickable task tool blocks.")
+  "Keymap for clickable task tool blocks.
+RET and a click open the subagent session; TAB is inherited from
+`opencode-session--tool-drawer-keymap' and toggles the task output.")
 
 (defun opencode-session-open-subagent ()
   "Open the subagent session at point."
@@ -533,10 +593,18 @@ properties and the user prefix indicator."
                     'opencode-part-type "assistant-text"
                     'face 'error)))))
 
+(defun opencode-session--ensure-blank-line (output)
+  "Return OUTPUT padded so it ends with a blank line."
+  (cond
+   ((string-match-p "\n\n\\'" output) output)
+   ((string-suffix-p "\n" output) (concat output "\n"))
+   (t (concat output "\n\n"))))
+
 (defun opencode-session--render-message-parts (message parts)
   "Render PARTS for MESSAGE into a string."
   (let ((output "")
-        (rendered-compaction nil))
+        (rendered-compaction nil)
+        (after-drawer nil))
     (dolist (entry parts)
       (let* ((part (cdr entry))
              (part-type (opencode-message-part-type part))
@@ -551,19 +619,27 @@ properties and the user prefix indicator."
                              rendered-compaction)))
           (when (string= part-type "compaction")
             (setq rendered-compaction t))
+          ;; An open drawer body is followed by a blank line so the next
+          ;; part does not run into the output.
+          (when after-drawer
+            (setq output (opencode-session--ensure-blank-line output)))
           (cond
            ((or (member part-type '("text" "reasoning" "compaction")) block-tool)
             (when (and (not (string-empty-p output))
-                       (not (string-match-p "\\n\\n+\\'" output)))
+                       (not (string-match-p "\n\n+\\'" output)))
               (setq output (concat output "\n")))
             (setq output (concat output rendered "\n")))
            (tool-part
             (when (and (not (string-empty-p output))
-                       (not (string-match-p "\\n\\'" output)))
+                       (not (string-match-p "\n\\'" output)))
               (setq output (concat output "\n")))
             (setq output (concat output rendered)))
            (t
-            (setq output (concat output rendered)))))))
+            (setq output (concat output rendered))))
+          (setq after-drawer
+                (and tool-part (not block-tool)
+                     (opencode-session--tool-drawer-open-p
+                      (opencode-message-part-id part)))))))
     output))
 
 (defun opencode-session--render-message-part (message part)
@@ -628,19 +704,29 @@ properties and the user prefix indicator."
          (extra (opencode-session--tool-extra-block tool input metadata part))
          (is-diff (and extra
                        (not (string-empty-p (string-trim extra)))
-                       (member tool '("edit" "apply_patch")))))
+                       (member tool '("edit" "apply_patch"))))
+         (drawer (opencode-session--tool-drawer-available-p part))
+         (part-id (opencode-message-part-id part))
+         (open (and drawer (opencode-session--tool-drawer-open-p part-id))))
     (setq text (opencode-session--tool-attach-status text status))
+    (when drawer
+      (setq text (opencode-session--tool-drawer-indicator
+                  (opencode-session--tool-drawer-propertize text part) open)))
     (when error-line
       (setq text (concat text "\n" error-line)))
-    (if is-diff
-        ;; Diff extra block: tool summary tagged as tool, diff tagged for font-lock
-        (concat (opencode-session--tool-propertize text)
-                "\n"
-                (propertize extra 'opencode-part-type "diff"))
-      ;; Non-diff extra: everything tagged as tool
-      (when (and extra (not (string-empty-p (string-trim extra))))
-        (setq text (concat text "\n" extra)))
-      (opencode-session--tool-propertize text))))
+    (setq text
+          (if is-diff
+              ;; Diff extra block: tool summary tagged as tool, diff tagged for font-lock
+              (concat (opencode-session--tool-propertize text)
+                      "\n"
+                      (propertize extra 'opencode-part-type "diff"))
+            ;; Non-diff extra: everything tagged as tool
+            (when (and extra (not (string-empty-p (string-trim extra))))
+              (setq text (concat text "\n" extra)))
+            (opencode-session--tool-propertize text)))
+    (if open
+        (concat text "\n" (opencode-session--tool-drawer-body part))
+      text)))
 
 (defun opencode-session--tool-attach-status (text status)
   "Append STATUS to the first line of TEXT when missing.
@@ -793,7 +879,7 @@ INPUT and METADATA may include the file path."
 
 (defun opencode-session--tool-extra-block (tool input metadata &optional part)
   "Return extra block content for TOOL from INPUT or METADATA.
-PART is the full message part, used for collapse identifiers."
+PART is the full message part, used by tools that inspect its state."
   (cond
    ((string= tool "read")
     (opencode-session--read-loaded-block metadata part))
@@ -801,7 +887,7 @@ PART is the full message part, used for collapse identifiers."
     (when (listp metadata)
       (opencode-session--nonempty-string (alist-get 'diff metadata))))
    ((string= tool "bash")
-    (opencode-session--bash-extra-block input metadata part))))
+    (opencode-session--bash-extra-block input metadata))))
 
 (defun opencode-session--read-loaded-block (metadata part)
   "Render instruction paths loaded by a completed read PART.
@@ -821,53 +907,14 @@ METADATA is the read tool's completion metadata."
                  (cl-remove-if-not #'stringp paths)
                  "\n"))))
 
-(defun opencode-session--bash-extra-block (input metadata part)
-  "Build the extra block for a bash tool call.
-Shows the command and output from INPUT and METADATA.
-PART provides the part ID for collapse identifiers.
-Output beyond `opencode-session-bash-output-max-lines' is
-hidden with a per-part invisibility symbol and a clickable
-toggle indicator."
-  (let* ((command (or (alist-get 'command input)
-                      (when (listp metadata)
-                        (alist-get 'command metadata))))
-         (raw-output (when (listp metadata)
-                       (alist-get 'output metadata)))
-         (output (when (opencode-session--nonempty-string raw-output)
-                   (opencode-session--strip-ansi (string-trim raw-output))))
-         (cmd-line (when (opencode-session--nonempty-string command)
-                     (format "$ %s" command)))
-         (max-lines opencode-session-bash-output-max-lines))
-    (when (or cmd-line output)
-      (let ((result (concat "\n" (or cmd-line ""))))
-        (when (opencode-session--nonempty-string output)
-          (let* ((lines (split-string output "\n"))
-                 (total (length lines)))
-            (if (and (> total max-lines) part)
-                (let* ((part-id (opencode-message-part-id part))
-                       (sym (opencode-session--collapse-symbol part-id))
-                       (visible (string-join (cl-subseq lines 0 max-lines) "\n"))
-                       (hidden (string-join (cl-subseq lines max-lines) "\n"))
-                       (overflow (- total max-lines))
-                       (indicator (format "▶ %d more lines" overflow)))
-                  ;; Collapse unless the user has manually expanded this block.
-                  (let ((user-expanded
-                         (and opencode-session--expanded-collapse-syms
-                              (gethash sym opencode-session--expanded-collapse-syms))))
-                    (unless user-expanded
-                      (add-to-invisibility-spec sym))
-                    (setq result (concat result "\n" visible "\n"
-                                         (propertize (concat hidden "\n")
-                                                     'invisible sym)
-                                         (propertize (if user-expanded "▼ collapse" indicator)
-                                                     'opencode-part-type "tool"
-                                                     'opencode-collapse-sym sym
-                                                     'opencode-collapse-count overflow
-                                                     'opencode-collapse-indicator sym
-                                                      'keymap opencode-session--collapse-keymap
-                                                      'mouse-face 'highlight)))))
-              (setq result (concat result "\n" output)))))
-        (concat result "\n")))))
+(defun opencode-session--bash-extra-block (input metadata)
+  "Return the command line for a bash tool call from INPUT or METADATA.
+The command output lives in the tool's drawer."
+  (let ((command (or (alist-get 'command input)
+                     (when (listp metadata)
+                       (alist-get 'command metadata)))))
+    (when (opencode-session--nonempty-string command)
+      (format "$ %s" command))))
 
 (defun opencode-session--task-current-tool (tools)
   "Return the latest non-pending tool entry from TOOLS."
@@ -922,7 +969,7 @@ Uses live subagent tool tracking data when available."
                     'opencode-subagent-session-id session-id
                     'keymap opencode-session--task-keymap
                     'mouse-face 'highlight
-                    'help-echo "RET: open subagent session")
+                    'help-echo "RET: open subagent session, TAB: toggle result")
       text)))
 
 (defun opencode-session--tool-webfetch (input)

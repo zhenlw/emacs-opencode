@@ -82,8 +82,10 @@ block displayed in the parent session buffer.
 - Rendering must not consume typed input when new output arrives.
 - Window point and scroll position should be preserved for users reading older
   output; windows already following the bottom should continue following it.
-- Collapsed tool output is keyed by message-part identity so user expansion can
-  survive re-renders.
+- Tool output drawers are keyed by message-part identity so an open drawer
+  survives re-renders. The drawer body is only inserted while open, and the
+  full output is fetched on demand because the SSE bridge strips it from live
+  events.
 - Header-line and retry banner state are derived from session status and message
   metadata, not from independent persistent UI state.
 

@@ -140,6 +140,18 @@ last `request' call made during BODY."
       (should (equal (plist-get args :params) '(("limit" . 5))))
       (should (null (plist-get args :data))))))
 
+;;; session-message
+
+(ert-deftest test-opencode-client/session-message-fetches-single-message ()
+  "Fetching one message hits the message endpoint with both IDs."
+  (let ((conn (opencode-client-test--connection "/tmp/project/")))
+    (opencode-client-test--with-captured-request url args
+      (opencode-client-session-message conn "ses_1" "msg_1"
+                                        :success #'ignore :error #'ignore)
+      (should (equal url "http://127.0.0.1:4096/session/ses_1/message/msg_1"))
+      (should (equal (plist-get args :type) "GET"))
+      (should (null (plist-get args :data))))))
+
 ;;; session-fork
 
 (ert-deftest test-opencode-client/session-fork-without-message-sends-no-body ()

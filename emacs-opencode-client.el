@@ -122,6 +122,18 @@ LIMIT restricts the number of returned messages when provided."
     :success success
     :error error))
 
+(cl-defmethod opencode-client-session-message ((conn opencode-connection) session-id message-id &key success error)
+  "Fetch the single message MESSAGE-ID in SESSION-ID.
+
+Unlike the SSE stream, the response includes full tool output in each
+part's state."
+  (opencode-request
+   conn
+   'GET
+   (format "/session/%s/message/%s" session-id message-id)
+   :success success
+   :error error))
+
 (cl-defmethod opencode-client-session-fork ((conn opencode-connection) session-id &key message-id success error)
   "Fork SESSION-ID.
 

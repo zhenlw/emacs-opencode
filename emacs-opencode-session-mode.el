@@ -815,6 +815,8 @@ PREVIOUS-NAME is the previous buffer name to compare against."
                     (concat (opencode-message-part-text previous) delta)
                   (or (opencode-message-part-text data)
                       (opencode-message-part-text previous)))))
+        (when (opencode-message-part-p previous)
+          (opencode-session--carry-tool-output previous data))
         (if existing
             (setf (opencode-message-parts message)
                   (cl-subst entry existing (opencode-message-parts message)))
@@ -823,6 +825,18 @@ PREVIOUS-NAME is the previous buffer name to compare against."
         (setf (opencode-message-text message)
               (opencode-session--message-text message))
         (opencode-session--render-message message)))))
+
+(defun opencode-session--carry-tool-output (previous data)
+  "Copy fetched tool output from PREVIOUS onto DATA when DATA lacks it.
+SSE part updates never carry output, so a later update to a completed
+tool part must not drop output fetched for an open drawer."
+  (let ((old-state (opencode-message-part-state previous))
+        (new-state (opencode-message-part-state data)))
+    (when (and (string= (or (opencode-message-part-type data) "") "tool")
+               (stringp (alist-get 'output old-state))
+               (not (alist-get 'output new-state)))
+      (setf (opencode-message-part-state data)
+            (cons (cons 'output (alist-get 'output old-state)) new-state)))))
 
 (defun opencode-session--message-part-from-info (info)
   "Create a message part object from INFO."
