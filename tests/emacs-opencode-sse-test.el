@@ -38,18 +38,18 @@
 ;;; build-url
 
 (ert-deftest test-opencode-sse/build-url ()
-  "Build the /event URL from a connection."
+  "Build the /api/event URL from a connection."
   (let ((conn (opencode-connection-create
                :base-url "http://localhost:4096")))
     (should (equal (opencode-sse--build-url conn)
-                   "http://localhost:4096/event"))))
+                   "http://localhost:4096/api/event"))))
 
 (ert-deftest test-opencode-sse/build-url-trailing-slash ()
-  "Strip trailing slash from base URL before appending /event."
+  "Strip trailing slash from base URL before appending /api/event."
   (let ((conn (opencode-connection-create
                :base-url "http://localhost:4096/")))
     (should (equal (opencode-sse--build-url conn)
-                   "http://localhost:4096/event"))))
+                   "http://localhost:4096/api/event"))))
 
 ;;; auth-header
 
@@ -749,7 +749,7 @@
         ;; URL arg.
         (should (member "--url" cmd))
         (should (equal (nth (1+ (cl-position "--url" cmd :test #'equal)) cmd)
-                       "http://localhost:4096/event"))
+                       "http://localhost:4096/api/event"))
         ;; Events arg.
         (should (member "--events" cmd))
         ;; Auth arg.
@@ -764,6 +764,38 @@
                (lambda () "/usr/bin/bun")))
       (let ((cmd (opencode-sse--build-bridge-command conn)))
         (should-not (member "--auth" cmd))))))
+
+;;; v2 frame envelope
+
+(ert-deftest test-opencode-sse/dispatch-exposes-data-as-properties ()
+  "V2 frames nest the payload under data; handlers see properties."
+  (let ((opencode-sse--handlers nil)
+        received)
+    (opencode-sse-register-handler
+     "session.text.delta"
+     (lambda (_event data _meta) (setq received data)))
+    (opencode-sse--dispatch
+     "session.text.delta"
+     '((type . "session.text.delta")
+       (data . ((sessionID . "s1") (delta . "hi"))))
+     nil)
+    (should (equal (alist-get 'delta (alist-get 'properties received))
+                   "hi"))))
+
+(ert-deftest test-opencode-sse/dispatch-keeps-properties-frames ()
+  "V1 frames carrying properties pass through unchanged."
+  (let ((opencode-sse--handlers nil)
+        received)
+    (opencode-sse-register-handler
+     "session.status"
+     (lambda (_event data _meta) (setq received data)))
+    (opencode-sse--dispatch
+     "session.status"
+     '((type . "session.status")
+       (properties . ((sessionID . "s1"))))
+     nil)
+    (should (equal (alist-get 'sessionID (alist-get 'properties received))
+                   "s1"))))
 
 (provide 'emacs-opencode-sse-test)
 

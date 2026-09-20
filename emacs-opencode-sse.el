@@ -94,10 +94,18 @@ META currently carries `:connection' (the originating connection)."
 
 META is a plist of event metadata.  It carries `:connection', the
 connection on which the event arrived, so handlers can route
-responses back to the correct OpenCode server."
+responses back to the correct OpenCode server.  V2 server frames
+nest the payload under `data'; it is exposed as `properties' here
+so handlers share one shape regardless of server version."
   (let ((handlers (alist-get event opencode-sse--handlers nil nil #'string=)))
-    (dolist (handler handlers)
-      (funcall handler event data meta))))
+    (when handlers
+      (let ((payload (if (and (listp data)
+                              (not (assq 'properties data))
+                              (assq 'data data))
+                         (cons (cons 'properties (alist-get 'data data)) data)
+                       data)))
+        (dolist (handler handlers)
+          (funcall handler event payload meta))))))
 
 (defun opencode-sse--decode-data (data)
   "Decode DATA from JSON.

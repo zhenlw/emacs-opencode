@@ -281,7 +281,7 @@ AGENTs are agent names mentioned in the text."
   (opencode-request
     conn
     'POST
-    (format "/session/%s/prompt" session-id)
+    (format "/api/session/%s/prompt" session-id)
     :json (append `((text . ,input))
                   (when agents `((agents . ,agents))))
    :parser (lambda () nil)
@@ -298,20 +298,30 @@ AGENTs are agent names mentioned in the text."
    :success success
    :error error))
 
-(cl-defmethod opencode-client-permission-reply ((conn opencode-connection) request-id reply &key message success error)
+(cl-defmethod opencode-client-permission-reply ((conn opencode-connection) request-id reply &key message session-id success error)
   "Reply to permission REQUEST-ID with REPLY.
 
-MESSAGE is sent when provided."
+MESSAGE is sent when provided.  SESSION-ID scopes the reply to the
+v2 session endpoint; without it the legacy top-level path is used."
   (let ((payload `((reply . ,reply))))
     (when message
       (setq payload (append payload `((message . ,message)))))
-    (opencode-request
-     conn
-     'POST
-     (format "/permission/%s/reply" request-id)
-     :json payload
-     :success success
-     :error error)))
+    (if session-id
+        (opencode-request
+         conn
+         'POST
+         (format "/api/session/%s/permission/%s/reply" session-id request-id)
+         :json `((decision . ,reply)
+                 ,@(when message `((message . ,message))))
+         :success success
+         :error error)
+      (opencode-request
+       conn
+       'POST
+       (format "/permission/%s/reply" request-id)
+       :json payload
+       :success success
+       :error error))))
 
 (defun opencode--vectorize-answers (answers)
   "Return ANSWERS as a vector of answer vectors."

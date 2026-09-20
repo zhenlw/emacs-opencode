@@ -18,6 +18,13 @@
 (declare-function opencode-session--message-text "emacs-opencode-session-render")
 (declare-function opencode-session--render-message "emacs-opencode-session-render")
 (declare-function opencode-session--upsert-compaction "emacs-opencode-session-mode")
+(declare-function opencode-session--ensure-stream-message "emacs-opencode-session-mode")
+(declare-function opencode-session--upsert-stream-part "emacs-opencode-session-mode")
+(declare-function opencode-session--stream-text-part-id "emacs-opencode-session-mode")
+(declare-function opencode-session--adopt-model-from-message "emacs-opencode-session-mode")
+(declare-function opencode-session--register-subagent "emacs-opencode-session-mode")
+(declare-function opencode-session--buffer-name "emacs-opencode-session-mode")
+(declare-function opencode-session--rename-buffer "emacs-opencode-session-mode")
 
 (cl-defstruct (opencode-session--prompt-state
                (:constructor opencode-session--prompt-state-create))
@@ -100,7 +107,8 @@ Return its new state, or nil when it is already registered."
 
 (defun opencode-session--handle-session-created (_event data)
   "Handle the session.created SSE DATA."
-  (let* ((info (alist-get 'info (alist-get 'properties data)))
+  (let* ((properties (alist-get 'properties data))
+         (info (or (alist-get 'info properties) properties))
          (session-id (alist-get 'id info)))
     (when-let* ((buffer (opencode-session--buffer-for-session session-id)))
       (when (buffer-live-p buffer)
@@ -227,11 +235,350 @@ tracking and re-render the parent task tool part."
                       (opencode-session--message-text message))
                 (opencode-session--render-message message)))))))))
 
+;;; V2 streaming event handlers.
+;; The v2 server replaced `message.*' events with a step/text/tool
+;; event family keyed by assistant message ID.  These handlers
+;; synthesize server-style part alists and reuse
+;; `opencode-session--update-message-part' so rendering is unchanged.
+
+(defun opencode-session--stream-buffer-for (session-id)
+  "Return the live session buffer for SESSION-ID, or nil."
+  (when-let* ((buffer (opencode-session--buffer-for-session session-id)))
+    (when (buffer-live-p buffer)
+      buffer)))
+
+(defun opencode-session--handle-step-started (_event data)
+  "Ensure the assistant message shell for a step.started event."
+  (let* ((properties (alist-get 'properties data))
+         (session-id (alist-get 'sessionID properties))
+         (message-id (alist-get 'assistantMessageID properties)))
+    (when (and session-id message-id)
+      (when-let* ((buffer (opencode-session--stream-buffer-for session-id)))
+        (with-current-buffer buffer
+          (let ((message (opencode-session--ensure-stream-message
+                          session-id message-id "assistant"))
+                (model (alist-get 'model properties)))
+            (setf (opencode-message-agent message)
+                  (alist-get 'agent properties))
+            (setf (opencode-message-model-id message)
+                  (or (alist-get 'modelID model) (alist-get 'id model)))
+            (setf (opencode-message-provider-id message)
+                  (alist-get 'providerID model))
+            (opencode-session--adopt-model-from-message message)
+            (opencode-session--render-header)))))))
+
+(defun opencode-session--handle-step-ended (_event data)
+  "Record the finish reason for a step.ended event."
+  (let* ((properties (alist-get 'properties data))
+         (session-id (alist-get 'sessionID properties))
+         (message-id (alist-get 'assistantMessageID properties))
+         (finish (alist-get 'finish properties)))
+    (when (and session-id message-id)
+      (when-let* ((buffer (opencode-session--stream-buffer-for session-id)))
+        (with-current-buffer buffer
+          (when-let* ((message (opencode-session--find-message message-id)))
+            (setf (opencode-message-finish message) finish)
+            (opencode-session--render-message message)))))))
+
+(defun opencode-session--stream-text (properties kind)
+  "Upsert KIND text for v2 PROPERTIES.
+KIND is \"text\" or \"reasoning\".  Delta fragments are appended;
+a full `text' value replaces the streamed value."
+  (let* ((session-id (alist-get 'sessionID properties))
+         (message-id (alist-get 'assistantMessageID properties))
+         (ordinal (alist-get 'ordinal properties))
+         (delta (alist-get 'delta properties))
+         (full (alist-get 'text properties)))
+    (when (and session-id message-id (numberp ordinal))
+      (when-let* ((buffer (opencode-session--stream-buffer-for session-id)))
+        (with-current-buffer buffer
+          (let ((message (opencode-session--ensure-stream-message
+                          session-id message-id))
+                (part-id (opencode-session--stream-text-part-id
+                          message-id kind ordinal)))
+            (cond
+             ;; Seed a new part with the first fragment; later
+             ;; fragments append through the update path.
+             ((and (stringp delta)
+                   (not (assoc part-id (opencode-message-parts message))))
+              (opencode-session--upsert-stream-part
+               session-id message-id part-id kind `((text . ,delta))))
+             ((stringp delta)
+              (opencode-session--upsert-stream-part
+               session-id message-id part-id kind nil delta))
+             ((stringp full)
+              (opencode-session--upsert-stream-part
+               session-id message-id part-id kind `((text . ,full)))))))))))
+
+(defun opencode-session--handle-text-started (_event data)
+  "Handle a session.text.started event."
+  (opencode-session--stream-text (alist-get 'properties data) "text"))
+
+(defun opencode-session--handle-text-delta (_event data)
+  "Handle a session.text.delta event."
+  (opencode-session--stream-text (alist-get 'properties data) "text"))
+
+(defun opencode-session--handle-text-ended (_event data)
+  "Handle a session.text.ended event."
+  (opencode-session--stream-text (alist-get 'properties data) "text"))
+
+(defun opencode-session--handle-reasoning-started (_event data)
+  "Handle a session.reasoning.started event."
+  (opencode-session--stream-text (alist-get 'properties data) "reasoning"))
+
+(defun opencode-session--handle-reasoning-delta (_event data)
+  "Handle a session.reasoning.delta event."
+  (opencode-session--stream-text (alist-get 'properties data) "reasoning"))
+
+(defun opencode-session--handle-reasoning-ended (_event data)
+  "Handle a session.reasoning.ended event."
+  (opencode-session--stream-text (alist-get 'properties data) "reasoning"))
+
+(defun opencode-session--merge-part-state (old-state extra)
+  "Merge EXTRA into OLD-STATE alists, with EXTRA winning."
+  (append extra
+          (cl-remove-if (lambda (cell)
+                          (and (consp cell) (assq (car cell) extra)))
+                        (or old-state nil))))
+
+(defun opencode-session--upsert-tool-state (session-id message-id part-id name extra-state)
+  "Upsert tool PART-ID for MESSAGE-ID merging EXTRA-STATE.
+NAME fills in the tool name when the event omits it.  The caller
+must be in the session buffer with the message shell ensured."
+  (let* ((message (opencode-session--ensure-stream-message session-id message-id))
+         (previous (cdr (assoc part-id (opencode-message-parts message))))
+         (old-state (and (opencode-message-part-p previous)
+                         (opencode-message-part-state previous)))
+         (old-name (and (opencode-message-part-p previous)
+                        (opencode-message-part-tool previous))))
+    (opencode-session--upsert-stream-part
+     session-id message-id part-id "tool"
+     `((tool . ,(or name old-name))
+       (state . ,(opencode-session--merge-part-state old-state extra-state))))))
+
+(defun opencode-session--with-tool-event (properties fn)
+  "Run FN in the session buffer for tool PROPERTIES.
+FN is called with SESSION-ID, MESSAGE-ID, and PART-ID."
+  (let ((session-id (alist-get 'sessionID properties))
+        (message-id (alist-get 'assistantMessageID properties))
+        (part-id (alist-get 'id properties)))
+    (when (and session-id message-id part-id)
+      (when-let* ((buffer (opencode-session--stream-buffer-for session-id)))
+        (with-current-buffer buffer
+          (funcall fn session-id message-id part-id))))))
+
+(defun opencode-session--handle-tool-input-started (_event data)
+  "Handle a session.tool.input.started event."
+  (let ((properties (alist-get 'properties data)))
+    (opencode-session--with-tool-event
+     properties
+     (lambda (session-id message-id part-id)
+       (opencode-session--upsert-tool-state
+        session-id message-id part-id
+        (alist-get 'name properties)
+        '((status . "running")))))))
+
+(defun opencode-session--handle-tool-input-delta (_event data)
+  "Handle a session.tool.input.delta event."
+  (let ((properties (alist-get 'properties data)))
+    (opencode-session--with-tool-event
+     properties
+     (lambda (session-id message-id part-id)
+       (let ((delta (alist-get 'delta properties)))
+         (when (stringp delta)
+           (let* ((message (opencode-session--ensure-stream-message
+                            session-id message-id))
+                  (previous (cdr (assoc part-id
+                                        (opencode-message-parts message))))
+                  (old-state (and (opencode-message-part-p previous)
+                                   (opencode-message-part-state previous)))
+                  (input (alist-get 'input old-state)))
+             (opencode-session--upsert-tool-state
+              session-id message-id part-id nil
+              (list (cons 'status "running")
+                    (cons 'input (concat (if (stringp input) input "")
+                                         delta)))))))))))
+
+(defun opencode-session--handle-tool-input-ended (_event data)
+  "Handle a session.tool.input.ended event."
+  (let ((properties (alist-get 'properties data)))
+    (opencode-session--with-tool-event
+     properties
+     (lambda (session-id message-id part-id)
+       (opencode-session--upsert-tool-state
+        session-id message-id part-id nil
+        (list (cons 'status "running")
+              (cons 'input (alist-get 'text properties))))))))
+
+(defun opencode-session--handle-tool-called (_event data)
+  "Handle a session.tool.called event."
+  (let ((properties (alist-get 'properties data)))
+    (opencode-session--with-tool-event
+     properties
+     (lambda (session-id message-id part-id)
+       (opencode-session--upsert-tool-state
+        session-id message-id part-id nil
+        (list (cons 'status "running")
+              (cons 'input (alist-get 'input properties))))
+       (opencode-session--register-task-subagent session-id message-id part-id
+                                                 (alist-get 'input properties))))))
+
+(defun opencode-session--tool-output-text (content)
+  "Return joined text from tool result CONTENT items."
+  (string-join (cl-loop for item in (opencode-session--normalize-items content)
+                        when (stringp (alist-get 'text item))
+                        collect (alist-get 'text item))
+               ""))
+
+(defun opencode-session--handle-tool-success (_event data)
+  "Handle a session.tool.success event."
+  (let ((properties (alist-get 'properties data)))
+    (opencode-session--with-tool-event
+     properties
+     (lambda (session-id message-id part-id)
+       (let ((output (opencode-session--tool-output-text
+                      (alist-get 'content properties))))
+         (opencode-session--upsert-tool-state
+          session-id message-id part-id nil
+          (append '((status . "completed"))
+                  (unless (string-empty-p output)
+                    (list (cons 'output output))))))))))
+
+(defun opencode-session--handle-tool-failed (_event data)
+  "Handle a session.tool.failed event."
+  (let ((properties (alist-get 'properties data)))
+    (opencode-session--with-tool-event
+     properties
+     (lambda (session-id message-id part-id)
+       (opencode-session--upsert-tool-state
+        session-id message-id part-id nil
+        (list (cons 'status "error")
+              (cons 'error (opencode-session--session-error-text
+                            (alist-get 'error properties)))))))))
+
+(defun opencode-session--register-task-subagent (session-id _message-id part-id input)
+  "Register a task tool PART-ID as a subagent when INPUT names a session."
+  (let ((subagent-id (and (listp input)
+                          (or (alist-get 'sessionId input)
+                              (alist-get 'sessionID input)))))
+    (when (and (stringp subagent-id) (not (string-empty-p subagent-id)))
+      (opencode-session--register-subagent subagent-id session-id part-id))))
+
+(defun opencode-session--handle-content-updated (_event data)
+  "Reconcile message text from a session.message.content.updated event."
+  (let* ((properties (alist-get 'properties data))
+         (session-id (alist-get 'sessionID properties))
+         (message-id (alist-get 'messageID properties))
+         (content (alist-get 'content properties)))
+    (when (and session-id message-id)
+      (when-let* ((buffer (opencode-session--stream-buffer-for session-id)))
+        (with-current-buffer buffer
+          (opencode-session--ensure-stream-message session-id message-id)
+          (let ((counters (make-hash-table :test #'equal)))
+            (dolist (item (opencode-session--normalize-items content))
+              (let ((type (alist-get 'type item)))
+                (cond
+                 ((member type '("text" "reasoning"))
+                  (let* ((count (1+ (gethash type counters 0)))
+                         (_ (puthash type count counters))
+                         (part-id (format "%s:%s:%d" message-id type (1- count))))
+                    (opencode-session--upsert-stream-part
+                     session-id message-id part-id type
+                     (list (cons 'text (alist-get 'text item))))))
+                 ((string= type "tool")
+                  (opencode-session--upsert-tool-state
+                   session-id message-id (alist-get 'id item)
+                   (alist-get 'name item)
+                   (list (cons 'status "completed")
+                         (cons 'input (alist-get 'input item))))))))))))))
+
+(defun opencode-session--handle-execution-started (_event data)
+  "Mark the session busy for a session.execution.started event."
+  (let ((session-id (alist-get 'sessionID (alist-get 'properties data))))
+    (when session-id
+      (opencode-session--update-status
+       session-id (opencode-status-create :type "busy")))))
+
+(defun opencode-session--handle-execution-ended (_event data status-type)
+  "Mark the session STATUS-TYPE for a terminal execution event."
+  (let* ((properties (alist-get 'properties data))
+         (session-id (alist-get 'sessionID properties)))
+    (when session-id
+      (opencode-session--update-status
+       session-id (opencode-status-create :type status-type))
+      (when-let* ((error-info (alist-get 'error properties)))
+        (message "OpenCode: %s"
+                 (opencode-session--session-error-text error-info))))))
+
+(defun opencode-session--handle-execution-succeeded (_event data)
+  "Handle a session.execution.succeeded event."
+  (opencode-session--handle-execution-ended _event data "idle"))
+
+(defun opencode-session--handle-execution-failed (_event data)
+  "Handle a session.execution.failed event."
+  (opencode-session--handle-execution-ended _event data "idle"))
+
+(defun opencode-session--handle-execution-interrupted (_event data)
+  "Handle a session.execution.interrupted event."
+  (opencode-session--handle-execution-ended _event data "idle"))
+
+(defun opencode-session--handle-session-renamed (_event data)
+  "Handle a session.renamed event."
+  (let* ((properties (alist-get 'properties data))
+         (session-id (alist-get 'sessionID properties))
+         (title (alist-get 'title properties)))
+    (when session-id
+      (when-let* ((buffer (opencode-session--stream-buffer-for session-id)))
+        (with-current-buffer buffer
+          (let ((previous-name (and opencode-session--session
+                                    (opencode-session--buffer-name
+                                     opencode-session--session))))
+            (unless opencode-session--session
+              (setq opencode-session--session
+                    (opencode-session-create :id session-id)))
+            (setf (opencode-session-title opencode-session--session) title)
+            (opencode-session--rename-buffer previous-name)
+            (opencode-session--render-header)))))))
+
+(defun opencode-session--handle-session-moved (_event data)
+  "Handle a session.moved event."
+  (let* ((properties (alist-get 'properties data))
+         (session-id (alist-get 'sessionID properties))
+         (directory (or (alist-get 'directory properties)
+                        (alist-get 'directory
+                                   (alist-get 'location properties)))))
+    (when session-id
+      (when-let* ((buffer (opencode-session--stream-buffer-for session-id)))
+        (with-current-buffer buffer
+          (when opencode-session--session
+            (setf (opencode-session-directory opencode-session--session)
+                  directory)
+            (opencode-session--render-header)))))))
+
+(defun opencode-session--handle-compaction-failed (_event data)
+  "Handle a session.compaction.failed event."
+  (let* ((properties (alist-get 'properties data))
+         (session-id (alist-get 'sessionID properties))
+         (message-id (or (alist-get 'messageID properties)
+                         (alist-get 'inputID properties)
+                         session-id))
+         (reason (or (alist-get 'reason properties) "manual")))
+    (when (and session-id message-id)
+      (when-let* ((buffer (opencode-session--stream-buffer-for session-id)))
+        (when (buffer-live-p buffer)
+          (with-current-buffer buffer
+            (opencode-session--upsert-compaction session-id message-id reason t)
+            (when-let* ((error-info (alist-get 'error properties)))
+              (message "OpenCode: %s"
+                       (opencode-session--session-error-text error-info)))))))))
+
 (defun opencode-session--handle-compaction-started (_event data)
   "Handle session compaction started SSE DATA."
   (let* ((properties (alist-get 'properties data))
          (session-id (alist-get 'sessionID properties))
-         (message-id (alist-get 'messageID properties))
+         (message-id (or (alist-get 'messageID properties)
+                         (alist-get 'inputID properties)
+                         session-id))
          (reason (or (alist-get 'reason properties) "manual")))
     (when (and session-id message-id)
       (when-let* ((buffer (opencode-session--buffer-for-session session-id)))
@@ -243,7 +590,9 @@ tracking and re-render the parent task tool part."
   "Handle session compaction ended SSE DATA."
   (let* ((properties (alist-get 'properties data))
          (session-id (alist-get 'sessionID properties))
-         (message-id (alist-get 'messageID properties))
+         (message-id (or (alist-get 'messageID properties)
+                         (alist-get 'inputID properties)
+                         session-id))
          (reason (or (alist-get 'reason properties) "manual"))
          (timestamp (or (alist-get 'timestamp properties) t)))
     (when (and session-id message-id)
@@ -350,6 +699,7 @@ PARENT-SESSION-ID is the session that owns the task tool part."
   "Prompt for PERMISSION and send a response via CONNECTION.
 STATE tracks whether another client resolves the request."
   (let* ((request-id (alist-get 'id permission))
+         (session-id (alist-get 'sessionID permission))
          (choices '("Allow once" "Allow always" "Deny"))
          (prompt (opencode-session--permission-prompt-label permission))
          (selection
@@ -377,6 +727,7 @@ STATE tracks whether another client resolves the request."
        connection
        request-id
        reply
+       :session-id session-id
        :success (lambda (&rest _args)
                   (message "OpenCode permission reply sent"))
        :error (lambda (&rest _args)
@@ -392,7 +743,16 @@ Falls back to any live session buffer on the same connection when
 SESSION-ID is unknown, e.g. for permission requests originating
 from subagent sessions.  Defers to a timer so `completing-read'
 does not block the process filter."
-  (let* ((permission (alist-get 'properties data))
+   (let* ((properties (alist-get 'properties data))
+         ;; V2 asks carry {action, resources}; present them with the
+         ;; v1 vocabulary the prompt UI reads ({permission, patterns}).
+         (permission (if (assq 'permission properties)
+                         properties
+                       (append (list (cons 'permission
+                                           (alist-get 'action properties))
+                                     (cons 'patterns
+                                           (alist-get 'resources properties)))
+                               properties)))
          (session-id (alist-get 'sessionID permission))
          (connection (plist-get meta :connection))
          (state (opencode-session--register-prompt
@@ -638,6 +998,12 @@ Returns nil when PATH is not a string."
 (opencode-sse-define-handler session-updated "session.updated" (_event data _meta)
   (opencode-session--handle-session-updated _event data))
 
+(opencode-sse-define-handler session-renamed "session.renamed" (_event data _meta)
+  (opencode-session--handle-session-renamed _event data))
+
+(opencode-sse-define-handler session-moved "session.moved" (_event data _meta)
+  (opencode-session--handle-session-moved _event data))
+
 (opencode-sse-define-handler session-status "session.status" (_event data _meta)
   (opencode-session--handle-session-status _event data))
 
@@ -676,6 +1042,75 @@ Returns nil when PATH is not a string."
 
 (opencode-sse-define-handler compaction-ended "session.next.compaction.ended" (_event data _meta)
   (opencode-session--handle-compaction-ended _event data))
+
+(opencode-sse-define-handler step-started "session.step.started" (_event data _meta)
+  (opencode-session--handle-step-started _event data))
+
+(opencode-sse-define-handler step-ended "session.step.ended" (_event data _meta)
+  (opencode-session--handle-step-ended _event data))
+
+(opencode-sse-define-handler text-started "session.text.started" (_event data _meta)
+  (opencode-session--handle-text-started _event data))
+
+(opencode-sse-define-handler text-delta "session.text.delta" (_event data _meta)
+  (opencode-session--handle-text-delta _event data))
+
+(opencode-sse-define-handler text-ended "session.text.ended" (_event data _meta)
+  (opencode-session--handle-text-ended _event data))
+
+(opencode-sse-define-handler reasoning-started "session.reasoning.started" (_event data _meta)
+  (opencode-session--handle-reasoning-started _event data))
+
+(opencode-sse-define-handler reasoning-delta "session.reasoning.delta" (_event data _meta)
+  (opencode-session--handle-reasoning-delta _event data))
+
+(opencode-sse-define-handler reasoning-ended "session.reasoning.ended" (_event data _meta)
+  (opencode-session--handle-reasoning-ended _event data))
+
+(opencode-sse-define-handler tool-input-started "session.tool.input.started" (_event data _meta)
+  (opencode-session--handle-tool-input-started _event data))
+
+(opencode-sse-define-handler tool-input-delta "session.tool.input.delta" (_event data _meta)
+  (opencode-session--handle-tool-input-delta _event data))
+
+(opencode-sse-define-handler tool-input-ended "session.tool.input.ended" (_event data _meta)
+  (opencode-session--handle-tool-input-ended _event data))
+
+(opencode-sse-define-handler tool-called "session.tool.called" (_event data _meta)
+  (opencode-session--handle-tool-called _event data))
+
+(opencode-sse-define-handler tool-success "session.tool.success" (_event data _meta)
+  (opencode-session--handle-tool-success _event data))
+
+(opencode-sse-define-handler tool-failed "session.tool.failed" (_event data _meta)
+  (opencode-session--handle-tool-failed _event data))
+
+(opencode-sse-define-handler content-updated "session.message.content.updated" (_event data _meta)
+  (opencode-session--handle-content-updated _event data))
+
+(opencode-sse-define-handler execution-started "session.execution.started" (_event data _meta)
+  (opencode-session--handle-execution-started _event data))
+
+(opencode-sse-define-handler execution-succeeded "session.execution.succeeded" (_event data _meta)
+  (opencode-session--handle-execution-succeeded _event data))
+
+(opencode-sse-define-handler execution-failed "session.execution.failed" (_event data _meta)
+  (opencode-session--handle-execution-failed _event data))
+
+(opencode-sse-define-handler execution-interrupted "session.execution.interrupted" (_event data _meta)
+  (opencode-session--handle-execution-interrupted _event data))
+
+(opencode-sse-define-handler compaction-v2-started "session.compaction.started" (_event data _meta)
+  (opencode-session--handle-compaction-started _event data))
+
+(opencode-sse-define-handler compaction-v2-ended "session.compaction.ended" (_event data _meta)
+  (opencode-session--handle-compaction-ended _event data))
+
+(opencode-sse-define-handler compaction-v2-failed "session.compaction.failed" (_event data _meta)
+  (opencode-session--handle-compaction-failed _event data))
+
+(opencode-sse-define-handler filesystem-changed "filesystem.changed" (_event data _meta)
+  (opencode-session--handle-file-updated _event data))
 
 (opencode-sse-define-handler file-edited "file.edited" (_event data _meta)
   (opencode-session--handle-file-updated _event data))

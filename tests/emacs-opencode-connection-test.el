@@ -75,7 +75,7 @@
 ;;; maybe-ready
 
 (ert-deftest test-opencode-connection/maybe-ready-matches ()
-  "Call ready callback when output contains the ready string."
+  "Call ready callback and store the password from server output."
   (let* ((conn (opencode-connection-create))
          (called nil)
          (fake-process (start-process "test-proc" nil "true")))
@@ -88,10 +88,12 @@
                      (lambda (&rest _) nil)))
             (opencode-connection--maybe-ready
              fake-process
-             "some output opencode server listening on :4096"
+             "some output server password PMfwPIGD7ezehQ4kSqePMtqmLVthY6zlOYFmoZxfRHs"
              conn
              (lambda (_proc) (setq called t))))
-          (should called))
+          (should called)
+          (should (equal (opencode-connection-password conn)
+                         "PMfwPIGD7ezehQ4kSqePMtqmLVthY6zlOYFmoZxfRHs")))
       (when (process-live-p fake-process)
         (delete-process fake-process)))))
 

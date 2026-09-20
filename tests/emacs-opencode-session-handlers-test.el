@@ -3,6 +3,7 @@
 (require 'ert)
 (require 'cl-lib)
 (require 'emacs-opencode-session-handlers)
+(require 'emacs-opencode-session-mode)
 
 ;;; session-error-text
 
@@ -535,6 +536,147 @@ reply must go to the originating connection, not an arbitrary buffer."
                           (questions . []))))
          (list :connection connection))))
     (should rejected)))
+
+;;; V2 streaming events
+
+(defmacro opencode-handlers-test--with-v2-buffer (id &rest body)
+  "Run BODY in a session buffer for session ID with live markers."
+  (declare (indent 1))
+  `(let ((opencode-session--buffers (make-hash-table :test 'equal))
+         (buffer (generate-new-buffer " *oc-v2-test*")))
+     (unwind-protect
+         (with-current-buffer buffer
+           (opencode-session-mode)
+           (setq-local opencode-session--session
+                       (opencode-session-create :id ,id))
+           (opencode-session--ensure-markers)
+           (opencode-session--ensure-input-region)
+           (puthash ,id buffer opencode-session--buffers)
+           ,@body)
+       (when (buffer-live-p buffer)
+         (kill-buffer buffer)))))
+
+(defun opencode-handlers-test--send-v2 (type data)
+  "Dispatch a v2 SSE frame of TYPE with DATA payload."
+  (opencode-sse--dispatch
+   type (list (cons 'type type) (cons 'data data)) nil))
+
+(ert-deftest test-opencode-handlers/v2-text-streaming-renders ()
+  "Step start plus text deltas render streamed text."
+  (opencode-handlers-test--with-v2-buffer "s1"
+    (opencode-handlers-test--send-v2
+     "session.step.started"
+     '((sessionID . "s1") (assistantMessageID . "m1") (agent . "build")))
+    (opencode-handlers-test--send-v2
+     "session.text.delta"
+     '((sessionID . "s1") (assistantMessageID . "m1")
+       (ordinal . 0) (delta . "Hello, ")))
+    (opencode-handlers-test--send-v2
+     "session.text.delta"
+     '((sessionID . "s1") (assistantMessageID . "m1")
+       (ordinal . 0) (delta . "world")))
+    (should (string-match-p
+             "Hello, world"
+             (buffer-substring-no-properties (point-min) (point-max))))))
+
+(ert-deftest test-opencode-handlers/v2-text-ended-replaces ()
+  "A text.ended event sets the authoritative full text."
+  (opencode-handlers-test--with-v2-buffer "s1"
+    (opencode-handlers-test--send-v2
+     "session.step.started"
+     '((sessionID . "s1") (assistantMessageID . "m1")))
+    (opencode-handlers-test--send-v2
+     "session.text.delta"
+     '((sessionID . "s1") (assistantMessageID . "m1")
+       (ordinal . 0) (delta . "Hel")))
+    (opencode-handlers-test--send-v2
+     "session.text.ended"
+     '((sessionID . "s1") (assistantMessageID . "m1")
+       (ordinal . 0) (text . "Hello")))
+    (let* ((message (opencode-session--find-message "m1"))
+           (part (cdr (assoc "m1:text:0" (opencode-message-parts message)))))
+      (should (equal (opencode-message-part-text part) "Hello")))))
+
+(ert-deftest test-opencode-handlers/v2-tool-lifecycle ()
+  "Tool input, call, and success render a completed tool part."
+  (opencode-handlers-test--with-v2-buffer "s1"
+    (opencode-handlers-test--send-v2
+     "session.step.started"
+     '((sessionID . "s1") (assistantMessageID . "m1")))
+    (opencode-handlers-test--send-v2
+     "session.tool.input.started"
+     '((sessionID . "s1") (assistantMessageID . "m1")
+       (id . "t1") (name . "bash")))
+    (opencode-handlers-test--send-v2
+     "session.tool.called"
+     '((sessionID . "s1") (assistantMessageID . "m1")
+       (id . "t1") (input . ((command . "ls")))))
+    (opencode-handlers-test--send-v2
+     "session.tool.success"
+     '((sessionID . "s1") (assistantMessageID . "m1")
+       (id . "t1") (content . (((type . "text") (text . "out"))))))
+    (let* ((message (opencode-session--find-message "m1"))
+           (part (cdr (assoc "t1" (opencode-message-parts message))))
+           (state (opencode-message-part-state part)))
+      (should (string= (opencode-message-part-tool part) "bash"))
+      (should (equal (alist-get 'status state) "completed"))
+      (should (equal (alist-get 'output state) "out"))
+      (should (equal (alist-get 'command (alist-get 'input state)) "ls")))))
+
+(ert-deftest test-opencode-handlers/v2-execution-status ()
+  "Execution start and success flip the session status."
+  (opencode-handlers-test--with-v2-buffer "s1"
+    (opencode-handlers-test--send-v2
+     "session.execution.started" '((sessionID . "s1")))
+    (should (equal (opencode-status-type
+                    (opencode-session-status opencode-session--session))
+                   "busy"))
+    (opencode-handlers-test--send-v2
+     "session.execution.succeeded" '((sessionID . "s1")))
+    (should (equal (opencode-status-type
+                    (opencode-session-status opencode-session--session))
+                   "idle"))))
+
+(ert-deftest test-opencode-handlers/v2-session-renamed ()
+  "A renamed event updates the session title."
+  (opencode-handlers-test--with-v2-buffer "s1"
+    (opencode-handlers-test--send-v2
+     "session.renamed" '((sessionID . "s1") (title . "New title")))
+    (should (equal (opencode-session-title opencode-session--session)
+                   "New title"))))
+
+(ert-deftest test-opencode-handlers/v2-content-updated-reconciles ()
+  "content.updated fills text parts for the message."
+  (opencode-handlers-test--with-v2-buffer "s1"
+    (opencode-handlers-test--send-v2
+     "session.step.started"
+     '((sessionID . "s1") (assistantMessageID . "m1")))
+    (opencode-handlers-test--send-v2
+     "session.message.content.updated"
+     '((sessionID . "s1") (messageID . "m1")
+       (content . (((type . "text") (text . "Full text"))))))
+    (should (string-match-p
+             "Full text"
+             (buffer-substring-no-properties (point-min) (point-max))))))
+
+(ert-deftest test-opencode-handlers/v2-permission-adapts-action ()
+  "A v2 permission ask maps action/resources onto the prompt UI."
+  (let ((opencode-session--buffers (make-hash-table :test 'equal))
+        (opencode-session--pending-prompts (make-hash-table :test #'eq))
+        (replied nil)
+        (payload '((properties . ((id . "per_1")
+                                  (sessionID . "s1")
+                                  (action . "read")
+                                  (resources . ("x.el")))))))
+    (cl-letf (((symbol-function 'completing-read)
+               (lambda (&rest _) "Allow once"))
+              ((symbol-function 'opencode-client-permission-reply)
+               (lambda (_conn _request-id value &rest args)
+                 (setq replied (cons value (plist-get args :session-id))))))
+      (opencode-handlers-test--with-sync-timer
+        (opencode-session--handle-permission-asked
+         "permission.asked" payload (list :connection 'conn))))
+    (should (equal replied '("once" . "s1")))))
 
 (provide 'emacs-opencode-session-handlers-test)
 

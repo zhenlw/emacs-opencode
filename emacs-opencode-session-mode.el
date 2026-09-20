@@ -812,6 +812,40 @@ PREVIOUS-NAME is the previous buffer name to compare against."
               (opencode-session--message-text message))
         (opencode-session--render-message message)))))
 
+(defun opencode-session--ensure-stream-message (session-id message-id &optional role)
+  "Return the message MESSAGE-ID for SESSION-ID, creating a shell first.
+ROLE defaults to \"assistant\".  The caller must be in the session
+buffer.  Streaming events arrive before any full message payload,
+so the shell is filled in incrementally by part updates."
+  (or (opencode-session--find-message message-id)
+      (let ((message (opencode-message-create
+                      :id message-id
+                      :session-id session-id
+                      :role (or role "assistant"))))
+        (setq opencode-session--messages
+              (append opencode-session--messages (list message)))
+        message)))
+
+(defun opencode-session--upsert-stream-part (session-id message-id part-id type extra &optional delta)
+  "Upsert streaming PART-ID of TYPE for MESSAGE-ID.
+EXTRA is an alist of additional server-style part fields.  DELTA is
+appended to text and reasoning parts.  The caller must be in the
+session buffer and have ensured the message shell with
+`opencode-session--ensure-stream-message'."
+  (opencode-session--update-message-part
+   (append (list (cons 'id part-id)
+                 (cons 'sessionID session-id)
+                 (cons 'messageID message-id)
+                 (cons 'type type))
+           extra)
+   delta))
+
+(defun opencode-session--stream-text-part-id (message-id kind ordinal)
+  "Return the synthesized part ID for MESSAGE-ID, KIND, and ORDINAL.
+KIND is \"text\" or \"reasoning\".  Server streaming events key text
+fragments by ordinal instead of part ID."
+  (format "%s:%s:%d" message-id kind ordinal))
+
 (defun opencode-session--carry-tool-output (previous data)
   "Copy fetched tool output from PREVIOUS onto DATA when DATA lacks it.
 SSE part updates never carry output, so a later update to a completed
@@ -1117,7 +1151,8 @@ Call ON-HISTORY-LOADED with BUFFER after the request completes."
                   (with-current-buffer buffer
                     (setq opencode-session--messages nil)
                     (dolist (item items)
-                      (opencode-session--hydrate-message item))
+                      (opencode-session--hydrate-message
+                       item (opencode-session-id session)))
                     (opencode-session--render-buffer))
                   (when on-history-loaded
                     (funcall on-history-loaded buffer)))))
@@ -1126,22 +1161,101 @@ Call ON-HISTORY-LOADED with BUFFER after the request completes."
             (when on-history-loaded
               (funcall on-history-loaded buffer)))))
 
-(defun opencode-session--hydrate-message (item)
-  "Add a message ITEM returned from the API."
+(defun opencode-session--hydrate-message (item &optional session-id)
+  "Add a message ITEM returned from the API.
+ITEM is either a v1 `{info, parts}' wrapper or a flat v2 message.
+SESSION-ID fills in the owner when ITEM carries none."
   (let* ((info (alist-get 'info item))
-         (parts (alist-get 'parts item))
-         (session-id (alist-get 'sessionID info))
-         (message (opencode-session--message-from-info info)))
-    (when message
+         (parts (alist-get 'parts item)))
+    (if info
+        (let ((owner (alist-get 'sessionID info))
+              (message (opencode-session--message-from-info info)))
+          (when message
+            (setf (opencode-message-parts message)
+                  (opencode-session--hydrate-parts parts))
+            ;; Register subagent mappings for any task tool parts
+            (dolist (raw-part (opencode-session--normalize-items parts))
+              (opencode-session--maybe-register-subagent raw-part owner))
+            (setf (opencode-message-text message)
+                  (opencode-session--message-text message))
+            (setq opencode-session--messages
+                  (append opencode-session--messages (list message)))))
+      (opencode-session--hydrate-v2-message item session-id))))
+
+(defun opencode-session--hydrate-v2-message (item session-id)
+  "Add flat v2 message ITEM owned by SESSION-ID."
+  (let* ((message-id (alist-get 'id item))
+         (kind (alist-get 'type item))
+         (role (if (member kind '("user" "assistant")) kind kind))
+         (time (alist-get 'time item))
+         (model (alist-get 'model item))
+         (message (opencode-message-create
+                   :id message-id
+                   :session-id (or session-id (alist-get 'sessionID item))
+                   :role role
+                   :agent (alist-get 'agent item)
+                   :model-id (or (alist-get 'modelID model)
+                                 (alist-get 'id model))
+                   :provider-id (alist-get 'providerID model)
+                   :time-created (alist-get 'created time)
+                   :time-completed (alist-get 'completed time)
+                   :info item)))
+    (when message-id
       (setf (opencode-message-parts message)
-            (opencode-session--hydrate-parts parts))
-      ;; Register subagent mappings for any task tool parts
-      (dolist (raw-part (opencode-session--normalize-items parts))
-        (opencode-session--maybe-register-subagent raw-part session-id))
+            (opencode-session--hydrate-v2-parts item message-id))
       (setf (opencode-message-text message)
             (opencode-session--message-text message))
       (setq opencode-session--messages
-            (append opencode-session--messages (list message))))))
+            (append opencode-session--messages (list message)))
+      message)))
+
+(defun opencode-session--hydrate-v2-parts (item message-id)
+  "Build message parts from flat v2 message ITEM."
+  (let ((kind (alist-get 'type item))
+        (result nil)
+        (counters (make-hash-table :test #'equal)))
+    (dolist (entry (opencode-session--hydrate-v2-content
+                    item (alist-get 'sessionID item)))
+      (let* ((type (alist-get 'type entry))
+             (count (1+ (gethash type counters 0)))
+             (_ (puthash type count counters))
+             (part-id (or (alist-get 'id entry)
+                          (format "%s:%s:%d" message-id type (1- count))))
+             (data (opencode-session--message-part-from-info
+                    (append (list (cons 'id part-id)
+                                  (cons 'messageID message-id))
+                            entry))))
+        (push (cons part-id data) result)))
+    ;; User text arrives as a top-level field rather than content items.
+    (when (and (string= (or kind "") "user")
+               (null result)
+               (stringp (alist-get 'text item)))
+      (let* ((part-id (format "%s:text:0" message-id))
+             (data (opencode-session--message-part-from-info
+                    (list (cons 'id part-id)
+                          (cons 'messageID message-id)
+                          (cons 'type "text")
+                          (cons 'text (alist-get 'text item))))))
+        (push (cons part-id data) result)))
+    (nreverse result)))
+
+(defun opencode-session--hydrate-v2-content (item session-id)
+  "Return v2 content entries for ITEM as server-style part alists.
+SESSION-ID is attached to each entry for part ownership."
+  (let ((content (alist-get 'content item)))
+    (delq nil
+          (mapcar (lambda (entry)
+                    (when-let* ((normalized (opencode-session--normalize-part-alist
+                                             entry)))
+                      (cons (cons 'sessionID session-id) normalized)))
+                  (opencode-session--normalize-items content)))))
+
+(defun opencode-session--normalize-part-alist (entry)
+  "Return ENTRY as an alist for part hydration."
+  (cond
+   ((and (listp entry) (consp (car entry))) entry)
+   ((vectorp entry) (append entry nil))
+   (t nil)))
 
 (defun opencode-session--hydrate-parts (parts)
   "Hydrate PARTS into an alist of message parts."

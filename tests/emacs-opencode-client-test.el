@@ -282,6 +282,31 @@ last `request' call made during BODY."
     (should (vectorp result))
     (should (= (length result) 0))))
 
+;;; permission-reply
+
+(ert-deftest test-opencode-client/permission-reply-session-scoped ()
+  "A session-scoped reply posts a decision to the v2 endpoint."
+  (let ((conn (opencode-client-test--connection "/tmp/project/")))
+    (opencode-client-test--with-captured-request url args
+      (opencode-client-permission-reply
+       conn "per_1" "once" :session-id "ses_1"
+       :success #'ignore :error #'ignore)
+      (should (equal url (concat "http://127.0.0.1:4096"
+                                 "/api/session/ses_1/permission/per_1/reply")))
+      (should (equal (plist-get args :type) "POST"))
+      (should (equal (plist-get args :data)
+                     (json-encode '((decision . "once"))))))))
+
+(ert-deftest test-opencode-client/permission-reply-legacy-without-session ()
+  "Without a session ID the legacy reply path is used."
+  (let ((conn (opencode-client-test--connection "/tmp/project/")))
+    (opencode-client-test--with-captured-request url args
+      (opencode-client-permission-reply
+       conn "per_1" "reject" :success #'ignore :error #'ignore)
+      (should (equal url "http://127.0.0.1:4096/permission/per_1/reply"))
+      (should (equal (plist-get args :data)
+                     (json-encode '((reply . "reject"))))))))
+
 (provide 'emacs-opencode-client-test)
 
 ;;; emacs-opencode-client-test.el ends here
