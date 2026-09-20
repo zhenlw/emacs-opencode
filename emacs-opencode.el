@@ -72,21 +72,26 @@ ON-SUCCESS and ON-ERROR are called with request args."
   (error "OpenCode server did not become ready within %ss" opencode-ready-timeout))
 
 (defun opencode--session-from-data (data)
-  "Create a session object from DATA."
-  (let* ((time (alist-get 'time data))
+  "Create a session object from DATA.
+
+DATA is either a session info alist or a response envelope wrapping
+one under its `data' key."
+  (let* ((info (or (alist-get 'data data) data))
+         (time (alist-get 'time info))
          (created (alist-get 'created time))
          (updated (alist-get 'updated time)))
     (opencode-session-create
-     :id (alist-get 'id data)
-     :slug (alist-get 'slug data)
-     :version (alist-get 'version data)
-     :project-id (alist-get 'projectID data)
-     :directory (alist-get 'directory data)
-     :title (alist-get 'title data)
+     :id (alist-get 'id info)
+     :slug (alist-get 'slug info)
+     :version (alist-get 'version info)
+     :project-id (alist-get 'projectID info)
+     :directory (or (alist-get 'directory info)
+                    (alist-get 'directory (alist-get 'location info)))
+     :title (alist-get 'title info)
      :time-created created
      :time-updated updated
-     :summary (alist-get 'summary data)
-     :info data)))
+     :summary (alist-get 'summary info)
+     :info info)))
 
 (defun opencode--session-label (info &optional include-identifiers)
   "Return a display label for session INFO.

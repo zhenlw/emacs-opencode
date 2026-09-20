@@ -124,11 +124,13 @@ HOSTNAME and PORT override the default server config."
   "Process OUTPUT and call READY-CALLBACK when server is ready."
   (when (and ready-callback
              (not (process-get process 'opencode-ready)))
-    (when (string-match-p "opencode server listening on" output)
-      (process-put process 'opencode-ready t)
-      (funcall ready-callback process)
-      (opencode-connection-ensure-providers connection)
-      (opencode-connection-ensure-commands connection))))
+    (when (string-match "server password \\([[:graph:]]+\\)" output)
+      (let ((password (match-string 1 output)))
+        (setf (opencode-connection-password connection) password)
+        (process-put process 'opencode-ready t)
+        (funcall ready-callback process)
+        (opencode-connection-ensure-providers connection)
+        (opencode-connection-ensure-commands connection)))))
 
 (defun opencode-connection-ensure-commands (connection &optional on-success on-error)
   "Ensure commands are fetched and cached for CONNECTION.

@@ -47,6 +47,19 @@
     ;; info should be the original data
     (should (equal (opencode-session-info session) data))))
 
+(ert-deftest test-opencode/session-from-data-envelope ()
+  "Unwrap the response envelope and read directory from location."
+  (let* ((inner '((id . "s1")
+                  (projectID . "p1")
+                  (location . ((directory . "/tmp")))
+                  (title . "Test Session")))
+         (session (opencode--session-from-data `((data . ,inner)))))
+    (should (opencode-session-p session))
+    (should (equal (opencode-session-id session) "s1"))
+    (should (equal (opencode-session-directory session) "/tmp"))
+    (should (equal (opencode-session-title session) "Test Session"))
+    (should (equal (opencode-session-info session) inner))))
+
 ;;; session-label
 
 (ert-deftest test-opencode/session-label-title-only ()

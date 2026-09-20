@@ -79,14 +79,24 @@ last `request' call made during BODY."
 
 ;;; session-create
 
-(ert-deftest test-opencode-client/session-create-sends-no-body ()
-  "Session creation posts /session with no request body."
+(ert-deftest test-opencode-client/session-create-sends-location ()
+  "Session creation posts /api/session with the directory as location."
   (let ((conn (opencode-client-test--connection "/tmp/project/")))
     (opencode-client-test--with-captured-request url args
       (opencode-client-session-create conn :success #'ignore :error #'ignore)
-      (should (equal url "http://127.0.0.1:4096/session"))
+      (should (equal url "http://127.0.0.1:4096/api/session"))
       (should (equal (plist-get args :type) "POST"))
-      (should (null (plist-get args :data))))))
+      (should (equal (plist-get args :data)
+                     (json-encode '((location
+                                     . ((directory . "/tmp/project"))))))))))
+
+(ert-deftest test-opencode-client/session-create-without-directory-sends-empty-object ()
+  "Session creation without a directory posts an empty JSON object."
+  (let ((conn (opencode-client-test--connection nil)))
+    (opencode-client-test--with-captured-request url args
+      (opencode-client-session-create conn :success #'ignore :error #'ignore)
+      (should (equal url "http://127.0.0.1:4096/api/session"))
+      (should (equal (plist-get args :data) "{}")))))
 
 ;;; sessions
 
@@ -126,7 +136,7 @@ last `request' call made during BODY."
     (opencode-client-test--with-captured-request url args
       (opencode-client-session-messages conn "ses_1"
                                          :success #'ignore :error #'ignore)
-      (should (equal url "http://127.0.0.1:4096/session/ses_1/message"))
+      (should (equal url "http://127.0.0.1:4096/api/session/ses_1/message"))
       (should (equal (plist-get args :type) "GET"))
       (should (null (plist-get args :params)))
       (should (null (plist-get args :data))))))
@@ -148,7 +158,7 @@ last `request' call made during BODY."
     (opencode-client-test--with-captured-request url args
       (opencode-client-session-message conn "ses_1" "msg_1"
                                         :success #'ignore :error #'ignore)
-      (should (equal url "http://127.0.0.1:4096/session/ses_1/message/msg_1"))
+      (should (equal url "http://127.0.0.1:4096/api/session/ses_1/message/msg_1"))
       (should (equal (plist-get args :type) "GET"))
       (should (null (plist-get args :data))))))
 

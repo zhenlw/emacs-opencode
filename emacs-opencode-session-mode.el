@@ -1106,9 +1106,12 @@ Call ON-HISTORY-LOADED with BUFFER after the request completes."
    (opencode-session-id session)
    :success (lambda (&rest args)
               (let* ((data (plist-get args :data))
+                     (payload (if (assq 'data data)
+                                  (alist-get 'data data)
+                                data))
                      (items (cond
-                             ((listp data) data)
-                             ((vectorp data) (append data nil))
+                             ((vectorp payload) (append payload nil))
+                             ((listp payload) payload)
                              (t nil))))
                 (when (buffer-live-p buffer)
                   (with-current-buffer buffer

@@ -48,14 +48,23 @@ provided, it is encoded and sent with a JSON content type. PARSER defaults to
 `json-read` when omitted. HEADERS is an alist of HTTP headers. Any remaining
 ARGS are forwarded to `request`.  Every request carries an
 x-opencode-directory header derived from the connection directory so the
-server routes session-less requests to the right workspace."
+server routes session-less requests to the right workspace.  When the
+connection has a password, an explicit `Authorization: Basic ...' header is
+added (unless the caller already supplied one)."
   (let* ((base-url (opencode-connection-base-url conn))
          (url (concat (string-remove-suffix "/" base-url) path))
-         (auth (when (opencode-connection-password conn)
-                 (list (or (opencode-connection-username conn) "opencode")
-                       (opencode-connection-password conn))))
+         (auth-header (when-let* ((password (opencode-connection-password conn)))
+                        (unless (assoc-string "Authorization" headers t)
+                          (let ((user (or (opencode-connection-username conn)
+                                          "opencode")))
+                            `(("Authorization"
+                               . ,(concat "Basic "
+                                          (base64-encode-string
+                                           (format "%s:%s" user password)
+                                           t))))))))
          (payload (when json (json-encode json)))
          (merged-headers (append (opencode-client--directory-header conn headers)
+                                 auth-header
                                  headers
                                  (when json
                                    '(("Content-Type" . "application/json")))))
@@ -69,7 +78,6 @@ server routes session-less requests to the right workspace."
      :data (or payload data)
      :parser (or parser #'opencode--json-read)
      :headers merged-headers
-     :auth auth
      :timeout timeout-value
      args)))
 
@@ -85,12 +93,15 @@ server routes session-less requests to the right workspace."
 (cl-defmethod opencode-client-session-create ((conn opencode-connection) &key success error)
   "Create a new session in CONN's directory.
 
-The request body is empty; the server resolves the target directory
-from the x-opencode-directory header sent with every request."
+The server resolves the session location from the `location' object in
+the request body."
   (opencode-request
    conn
    'POST
-   "/session"
+   "/api/session"
+   :json (if-let* ((directory (opencode-connection-directory conn)))
+             `((location . ((directory . ,(directory-file-name directory)))))
+           (make-hash-table :test 'equal))
    :success success
    :error error))
 
@@ -117,7 +128,7 @@ LIMIT restricts the number of returned messages when provided."
   (opencode-request
    conn
    'GET
-   (format "/session/%s/message" session-id)
+   (format "/api/session/%s/message" session-id)
    :params (when limit `(("limit" . ,limit)))
     :success success
     :error error))
@@ -130,7 +141,7 @@ part's state."
   (opencode-request
    conn
    'GET
-   (format "/session/%s/message/%s" session-id message-id)
+   (format "/api/session/%s/message/%s" session-id message-id)
    :success success
    :error error))
 
