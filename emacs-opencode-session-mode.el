@@ -510,35 +510,21 @@ whitespace or appear at the start of the string."
         (setq start (match-end 0))))
     (delete-dups (nreverse mentions))))
 
-(defun opencode-session--build-message-parts (input)
-  "Build the message parts list for INPUT.
-Returns a list of part alists including a text part and any @-agent
-parts extracted from the input."
-  (let ((text-part `(("type" . "text") ("text" . ,input)))
-        (agent-names (opencode-session--extract-agent-mentions input))
-        (parts nil))
-    (push text-part parts)
-    (dolist (name agent-names)
-      (push `(("type" . "agent") ("name" . ,name)) parts))
-    (nreverse parts)))
-
 (defun opencode-session--send-input (connection session input)
   "Send INPUT to SESSION using CONNECTION.
 
-Parses @-agent mentions from INPUT and includes them as agent parts
-alongside the text part.  Restores INPUT when the request fails."
+Parses @-agent mentions from INPUT and includes them as agents attachments.
+Restores INPUT when the request fails."
   (let ((session-id (opencode-session-id session))
-        (parts (opencode-session--build-message-parts input))
-        (agent opencode-session--agent)
-        (model (opencode-session--selected-model))
-        (variant opencode-session--variant))
+        (agents nil)
+        (agent-names (opencode-session--extract-agent-mentions input)))
+    (dolist (name agent-names)
+      (push `((name . ,name)) agents))
     (opencode-client-session-prompt-async
      connection
      session-id
-     parts
-     :agent agent
-     :variant variant
-     :model model
+     input
+     :agents (nreverse agents)
      :success (lambda (&rest _args)
                 (message "OpenCode: message queued"))
      :error (lambda (&rest _args)

@@ -78,7 +78,7 @@ server routes session-less requests to the right workspace."
   (opencode-request
    conn
    'GET
-   "/global/health"
+   "/api/info"
    :success success
    :error error))
 
@@ -180,7 +180,7 @@ MODEL is a cons (PROVIDER-ID . MODEL-ID)."
   (opencode-request
    conn
    'GET
-   "/agent"
+   "/api/agent"
    :success success
    :error error))
 
@@ -189,7 +189,7 @@ MODEL is a cons (PROVIDER-ID . MODEL-ID)."
   (opencode-request
    conn
    'GET
-   "/provider"
+   "/api/provider"
    :success success
    :error error))
 
@@ -198,7 +198,7 @@ MODEL is a cons (PROVIDER-ID . MODEL-ID)."
   (opencode-request
    conn
    'GET
-   "/command"
+   "/api/command"
    :success success
    :error error))
 
@@ -263,21 +263,16 @@ AUTH-INFO is an alist representing the auth payload."
    :error error))
 
 (cl-defmethod opencode-client-session-prompt-async
-  ((conn opencode-connection) session-id parts &key success error agent model variant)
-  "Send PARTS to SESSION-ID asynchronously.
+  ((conn opencode-connection) session-id input &key success error agents)
+  "Send input to SESSION-ID asynchronously.
 
-PARTS is a list of message part objects for the request body. AGENT and
-VARIANT are included when provided. MODEL is a cons (PROVIDER-ID . MODEL-ID)
-included when provided."
+AGENTs are agent names mentioned in the text."
   (opencode-request
     conn
     'POST
-    (format "/session/%s/prompt_async" session-id)
-    :json (append (when agent `((agent . ,agent)))
-                  (when variant `((variant . ,variant)))
-                  (when model `((model . ((providerID . ,(car model))
-                                          (modelID . ,(cdr model))))))
-                  `((parts . ,parts)))
+    (format "/session/%s/prompt" session-id)
+    :json (append `((text . ,input))
+                  (when agents `((agents . ,agents))))
    :parser (lambda () nil)
    :success success
    :error error))
