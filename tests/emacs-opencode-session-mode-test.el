@@ -206,25 +206,23 @@
 
 ;;; compact command
 
-(ert-deftest test-opencode-session-mode/compact-sends-active-model ()
-  "The compact command sends the current session and active model."
+(ert-deftest test-opencode-session-mode/compact-sends-session ()
+  "The compact command sends the current session."
   (with-temp-buffer
     (opencode-session-mode)
     (setq-local opencode-session--session (opencode-session-create :id "s1"))
     (setq-local opencode-session--provider-id "anthropic")
     (setq-local opencode-session--model-id "claude")
-    (let (sent-connection sent-session sent-model)
+    (let (sent-connection sent-session)
       (cl-letf (((symbol-function 'opencode-session--ensure-connection)
                  (lambda (callback) (funcall callback 'conn)))
                 ((symbol-function 'opencode-client-session-compact)
-                 (lambda (connection session-id model &rest _args)
+                 (lambda (connection session-id &rest _args)
                    (setq sent-connection connection
-                         sent-session session-id
-                         sent-model model))))
+                         sent-session session-id))))
         (opencode-session-compact))
       (should (eq sent-connection 'conn))
-      (should (equal sent-session "s1"))
-      (should (equal sent-model '("anthropic" . "claude"))))))
+      (should (equal sent-session "s1")))))
 
 ;;; rename command
 
@@ -318,28 +316,22 @@
           '(((id . "explore") (mode . "subagent") (hidden . nil))))))
     (should (null (opencode-session--extract-agent-mentions "email@explore")))))
 
-;;; build-message-parts
+;;; prompt agents
 
-(ert-deftest test-opencode-session-mode/build-parts-text-only ()
-  "Build parts with no mentions."
+(ert-deftest test-opencode-session-mode/prompt-agents-text-only ()
+  "No attachments without mentions."
   (let ((opencode-session--connection
          (opencode-connection-create :agents-raw
           '(((id . "explore") (mode . "subagent") (hidden . nil))))))
-    (let ((parts (opencode-session--build-message-parts "hello world")))
-      (should (= (length parts) 1))
-      (should (equal (cdr (assoc "type" (car parts))) "text"))
-      (should (equal (cdr (assoc "text" (car parts))) "hello world")))))
+    (should (null (opencode-session--prompt-agents "hello world")))))
 
-(ert-deftest test-opencode-session-mode/build-parts-with-mention ()
-  "Build parts with an @-mention."
+(ert-deftest test-opencode-session-mode/prompt-agents-with-mention ()
+  "Mentions become name attachments."
   (let ((opencode-session--connection
          (opencode-connection-create :agents-raw
           '(((id . "explore") (mode . "subagent") (hidden . nil))))))
-    (let ((parts (opencode-session--build-message-parts "hello @explore")))
-      (should (= (length parts) 2))
-      (should (equal (cdr (assoc "type" (car parts))) "text"))
-      (should (equal (cdr (assoc "type" (cadr parts))) "agent"))
-      (should (equal (cdr (assoc "name" (cadr parts))) "explore")))))
+    (should (equal (opencode-session--prompt-agents "hello @explore")
+                   '(((name . "explore")))))))
 
 ;;; agent-completion-bounds
 

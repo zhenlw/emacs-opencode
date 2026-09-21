@@ -113,6 +113,111 @@
       (when (process-live-p fake-process)
         (delete-process fake-process)))))
 
+;;; provider payloads (v2)
+
+(ert-deftest test-opencode-connection/provider-items-v2-envelope ()
+  "Unwrap the v2 {data: [...]} provider envelope."
+  (should (equal (opencode-connection--provider-items
+                  '((data . (((id . "anthropic"))))))
+                 '(((id . "anthropic"))))))
+
+(ert-deftest test-opencode-connection/provider-items-v1-shape ()
+  "Accept the legacy {all: [...]} provider shape."
+  (should (equal (opencode-connection--provider-items
+                  '((all . (((id . "anthropic"))))))
+                 '(((id . "anthropic"))))))
+
+(ert-deftest test-opencode-connection/provider-items-vector ()
+  "Normalize a vector payload to a list."
+  (should (equal (opencode-connection--provider-items
+                  '((data . [((id . "a"))])))
+                 '(((id . "a"))))))
+
+(ert-deftest test-opencode-connection/ensure-providers-caches-v2 ()
+  "A v2 provider fetch attaches models and does not refire."
+  (let ((conn (opencode-connection-create))
+        (provider-calls 0)
+        (model-calls 0)
+        (providers '((data . (((id . "anthropic") (name . "Anthropic"))))))
+        (models '((data . (((providerID . "anthropic")
+                            (modelID . "claude")
+                            (enabled . t)))))))
+    (cl-letf (((symbol-function 'opencode-client-providers)
+               (lambda (_conn &rest args)
+                 (setq provider-calls (1+ provider-calls))
+                 (funcall (plist-get args :success) :data providers)))
+              ((symbol-function 'opencode-client-models)
+               (lambda (_conn &rest args)
+                 (setq model-calls (1+ model-calls))
+                 (funcall (plist-get args :success) :data models))))
+      (opencode-connection-ensure-providers conn #'ignore #'ignore)
+      (should (= provider-calls 1))
+      (should (= model-calls 1))
+      ;; Models are attached; catalog synthesizes all/connected.
+      (let* ((items (opencode-connection-providers conn))
+             (provider (car items))
+             (catalog (opencode-connection-provider-catalog conn)))
+        (should (equal (cdr (assoc 'models provider))
+                       '(("claude" . ((providerID . "anthropic")
+                                      (modelID . "claude")
+                                      (enabled . t))))))
+        (should (equal (alist-get 'connected catalog) '("anthropic"))))
+      ;; Second call uses the cache without refiring.
+      (opencode-connection-ensure-providers conn #'ignore #'ignore)
+      (should (= provider-calls 1))
+      (should (= model-calls 1)))))
+
+(ert-deftest test-opencode-connection/ensure-providers-empty-marks-unavailable ()
+  "An empty provider list is cached so callers do not retry."
+  (let ((conn (opencode-connection-create))
+        (calls 0))
+    (cl-letf (((symbol-function 'opencode-client-providers)
+               (lambda (_conn &rest args)
+                 (setq calls (1+ calls))
+                 (funcall (plist-get args :success) :data '((data . [])))))
+              ((symbol-function 'opencode-client-models)
+               (lambda (_conn &rest _args)
+                 (error "models must not be fetched without providers"))))
+      (opencode-connection-ensure-providers conn #'ignore #'ignore)
+      (should (= calls 1))
+      (should (eq (opencode-connection-providers conn) :unavailable))
+      (opencode-connection-ensure-providers conn #'ignore #'ignore)
+      (should (= calls 1)))))
+
+(ert-deftest test-opencode-connection/ensure-providers-no-timer-retry ()
+  "A latched empty marker never refires on its own."
+  (let ((conn (opencode-connection-create))
+        (calls 0))
+    (cl-letf (((symbol-function 'opencode-client-providers)
+               (lambda (_conn &rest args)
+                 (setq calls (1+ calls))
+                 (funcall (plist-get args :success) :data '((data . [])))))
+              ((symbol-function 'opencode-client-models)
+               (lambda (_conn &rest _args) nil)))
+      (opencode-connection-ensure-providers conn #'ignore #'ignore)
+      (should (= calls 1))
+      (opencode-connection-ensure-providers conn #'ignore #'ignore)
+      (opencode-connection-ensure-providers conn #'ignore #'ignore)
+      (should (= calls 1))
+      (should (eq (opencode-connection-providers conn) :unavailable)))))
+
+(ert-deftest test-opencode-connection/providers-changed-refetches ()
+  "A catalog change clears the empty marker and refetches."
+  (let ((conn (opencode-connection-create))
+        (calls 0))
+    (cl-letf (((symbol-function 'opencode-client-providers)
+               (lambda (_conn &rest args)
+                 (setq calls (1+ calls))
+                 (funcall (plist-get args :success) :data '((data . [])))))
+              ((symbol-function 'opencode-client-models)
+               (lambda (_conn &rest _args) nil)))
+      (opencode-connection-ensure-providers conn #'ignore #'ignore)
+      (should (= calls 1))
+      (should (eq (opencode-connection-providers conn) :unavailable))
+      (opencode-connection-providers-changed conn)
+      (should (= calls 2))
+      (should (eq (opencode-connection-providers conn) :unavailable)))))
+
 (provide 'emacs-opencode-connection-test)
 
 ;;; emacs-opencode-connection-test.el ends here

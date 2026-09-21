@@ -244,16 +244,12 @@ input is preserved across the re-render."
      (lambda (connection)
        (when (buffer-live-p buffer)
          (with-current-buffer buffer
-           (let ((session-id (opencode-session-id opencode-session--session))
-                 (model (opencode-session--active-model)))
+           (let ((session-id (opencode-session-id opencode-session--session)))
              (unless session-id
                (error "OpenCode session ID is missing"))
-             (unless model
-               (error "OpenCode session has no selected model"))
              (opencode-client-session-compact
               connection
               session-id
-              model
               :success (lambda (&rest _args)
                          (message "OpenCode: compaction queued"))
               :error (lambda (&rest args)
@@ -340,9 +336,7 @@ message, fork the whole session."
        (when (buffer-live-p buffer)
          (with-current-buffer buffer
            (let ((session-id (opencode-session-id opencode-session--session))
-                 (agent opencode-session--agent)
-                 (model (opencode-session--selected-model-string))
-                 (variant opencode-session--variant))
+                 (agent opencode-session--agent))
              (opencode-client-commands
               connection
               :success (lambda (&rest args)
@@ -362,8 +356,6 @@ message, fork the whole session."
                               command
                               arguments
                               :agent agent
-                              :variant variant
-                              :model model
                               :success (lambda (&rest _args)
                                          (message "OpenCode command queued"))
                               :error (lambda (&rest _args)
@@ -510,21 +502,25 @@ whitespace or appear at the start of the string."
         (setq start (match-end 0))))
     (delete-dups (nreverse mentions))))
 
+(defun opencode-session--prompt-agents (input)
+  "Return v2 agent attachments for @-mentions in INPUT, or nil.
+Each attachment is an alist with a `name' key."
+  (let ((names (opencode-session--extract-agent-mentions input)))
+    (when names
+      (mapcar (lambda (name) `((name . ,name))) names))))
+
 (defun opencode-session--send-input (connection session input)
   "Send INPUT to SESSION using CONNECTION.
 
 Parses @-agent mentions from INPUT and includes them as agents attachments.
 Restores INPUT when the request fails."
   (let ((session-id (opencode-session-id session))
-        (agents nil)
-        (agent-names (opencode-session--extract-agent-mentions input)))
-    (dolist (name agent-names)
-      (push `((name . ,name)) agents))
+        (agents (opencode-session--prompt-agents input)))
     (opencode-client-session-prompt-async
      connection
      session-id
      input
-     :agents (nreverse agents)
+     :agents agents
      :success (lambda (&rest _args)
                 (message "OpenCode: message queued"))
      :error (lambda (&rest _args)
@@ -546,15 +542,11 @@ original INPUT; for `shell' the leading \"!\" is stripped."
   "Send shell COMMAND to SESSION using CONNECTION.
 
 Restores the original input (with leading !) when the request fails."
-  (let ((session-id (opencode-session-id session))
-        (agent opencode-session--agent)
-        (model (opencode-session--selected-model)))
+  (let ((session-id (opencode-session-id session)))
     (opencode-client-session-shell
      connection
      session-id
      command
-     :agent agent
-     :model model
      :success (lambda (&rest _args)
                 (message "OpenCode: shell command queued"))
      :error (lambda (&rest _args)
@@ -586,8 +578,6 @@ Falls back to a normal prompt when INPUT does not match an available command."
                              command
                              arguments
                              :agent opencode-session--agent
-                             :variant opencode-session--variant
-                             :model (opencode-session--selected-model-string)
                              :success (lambda (&rest _args)
                                         (message "OpenCode command queued"))
                              :error (lambda (&rest _args)
@@ -613,8 +603,11 @@ Falls back to a normal prompt when INPUT does not match an available command."
               title))))
 
 (defun opencode-session--session-from-info (info)
-  "Create a session object from INFO."
-  (let* ((time (alist-get 'time info))
+  "Create a session object from INFO.
+INFO is either a session object or a response envelope wrapping
+one under its `data' key."
+  (let* ((info (or (alist-get 'data info) info))
+         (time (alist-get 'time info))
          (created (alist-get 'created time))
          (updated (alist-get 'updated time)))
     (opencode-session-create
@@ -622,7 +615,8 @@ Falls back to a normal prompt when INPUT does not match an available command."
      :slug (alist-get 'slug info)
      :version (alist-get 'version info)
      :project-id (alist-get 'projectID info)
-     :directory (alist-get 'directory info)
+     :directory (or (alist-get 'directory info)
+                    (alist-get 'directory (alist-get 'location info)))
      :title (alist-get 'title info)
      :time-created created
      :time-updated updated
@@ -919,8 +913,11 @@ compaction part as completed."
 ;;; Session state management
 
 (defun opencode-session--update-session (info)
-  "Update the buffer session from INFO."
-  (let* ((time (alist-get 'time info))
+  "Update the buffer session from INFO.
+INFO is either a session object or a response envelope wrapping
+one under its `data' key."
+  (let* ((info (or (alist-get 'data info) info))
+         (time (alist-get 'time info))
          (created (alist-get 'created time))
          (updated (alist-get 'updated time))
          (previous-name (and opencode-session--session
@@ -930,7 +927,9 @@ compaction part as completed."
     (setf (opencode-session-slug opencode-session--session) (alist-get 'slug info))
     (setf (opencode-session-version opencode-session--session) (alist-get 'version info))
     (setf (opencode-session-project-id opencode-session--session) (alist-get 'projectID info))
-    (setf (opencode-session-directory opencode-session--session) (alist-get 'directory info))
+    (setf (opencode-session-directory opencode-session--session)
+          (or (alist-get 'directory info)
+              (alist-get 'directory (alist-get 'location info))))
     (setf (opencode-session-title opencode-session--session) (alist-get 'title info))
     (setf (opencode-session-time-created opencode-session--session) created)
     (setf (opencode-session-time-updated opencode-session--session) updated)

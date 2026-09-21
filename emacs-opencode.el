@@ -172,7 +172,9 @@ Call ON-SELECTED with the selected session and session info data."
               (let* ((data (plist-get args :data))
                      (items (cl-remove-if
                              (lambda (item) (alist-get 'parentID item))
-                             (opencode--session-items data)))
+                             (opencode--session-items
+                              (or (and (listp data) (alist-get 'data data))
+                                  data))))
                      (ordered-items (opencode--order-sessions-by-buffer items))
                      (choices (opencode--session-choices ordered-items))
                      (table (lambda (string pred action)

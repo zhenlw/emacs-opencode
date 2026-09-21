@@ -105,7 +105,7 @@ last `request' call made during BODY."
   (let ((conn (opencode-client-test--connection "/tmp/project/")))
     (opencode-client-test--with-captured-request url args
       (opencode-client-sessions conn :success #'ignore :error #'ignore)
-      (should (equal url "http://127.0.0.1:4096/session"))
+      (should (equal url "http://127.0.0.1:4096/api/session"))
       (should (equal (plist-get args :type) "GET"))
       (should (null (plist-get args :params)))
       (should (null (plist-get args :data))))))
@@ -164,23 +164,23 @@ last `request' call made during BODY."
 
 ;;; session-fork
 
-(ert-deftest test-opencode-client/session-fork-without-message-sends-no-body ()
-  "Forking a whole session posts no request body."
+(ert-deftest test-opencode-client/session-fork-without-message-sends-empty-object ()
+  "Forking a whole session posts an empty JSON object."
   (let ((conn (opencode-client-test--connection "/tmp/project/")))
     (opencode-client-test--with-captured-request url args
       (opencode-client-session-fork conn "ses_1" :success #'ignore :error #'ignore)
-      (should (equal url "http://127.0.0.1:4096/session/ses_1/fork"))
+      (should (equal url "http://127.0.0.1:4096/api/session/ses_1/fork"))
       (should (equal (plist-get args :type) "POST"))
-      (should (null (plist-get args :data))))))
+      (should (equal (plist-get args :data) "{}")))))
 
-(ert-deftest test-opencode-client/session-fork-with-message-sends-message-id ()
-  "Forking at a message sends MESSAGE-ID in the JSON body."
+(ert-deftest test-opencode-client/session-fork-with-message-sends-before ()
+  "Forking at a message sends MESSAGE-ID as before."
   (let ((conn (opencode-client-test--connection "/tmp/project/")))
     (opencode-client-test--with-captured-request _url args
       (opencode-client-session-fork conn "ses_1" :message-id "msg_1"
                                     :success #'ignore :error #'ignore)
       (should (equal (plist-get args :data)
-                     (json-encode '((messageID . "msg_1"))))))))
+                     (json-encode '((before . "msg_1"))))))))
 
 ;;; session-rename
 
@@ -190,25 +190,148 @@ last `request' call made during BODY."
     (opencode-client-test--with-captured-request url args
       (opencode-client-session-rename conn "ses_1" "New title"
                                       :success #'ignore :error #'ignore)
-      (should (equal url "http://127.0.0.1:4096/session/ses_1"))
+      (should (equal url "http://127.0.0.1:4096/api/session/ses_1"))
       (should (equal (plist-get args :type) "PATCH"))
       (should (equal (plist-get args :data)
                      (json-encode '((title . "New title"))))))))
 
 ;;; session-compact
 
-(ert-deftest test-opencode-client/session-compact-sends-model ()
-  "Compacting a session posts selected model data."
+(ert-deftest test-opencode-client/session-compact-sends-empty-object ()
+  "Compacting a session posts an empty JSON object."
   (let ((conn (opencode-client-test--connection "/tmp/project/")))
     (opencode-client-test--with-captured-request url args
-      (opencode-client-session-compact conn "ses_1" '("anthropic" . "claude")
+      (opencode-client-session-compact conn "ses_1"
                                        :success #'ignore :error #'ignore)
-      (should (equal url "http://127.0.0.1:4096/session/ses_1/summarize"))
+      (should (equal url "http://127.0.0.1:4096/api/session/ses_1/compact"))
       (should (equal (plist-get args :type) "POST"))
+      (should (equal (plist-get args :data) "{}")))))
+
+;;; session-abort
+
+(ert-deftest test-opencode-client/session-abort-posts-interrupt ()
+  "Aborting posts to the interrupt endpoint with no body."
+  (let ((conn (opencode-client-test--connection "/tmp/project/")))
+    (opencode-client-test--with-captured-request url args
+      (opencode-client-session-abort conn "ses_1"
+                                     :success #'ignore :error #'ignore)
+      (should (equal url "http://127.0.0.1:4096/api/session/ses_1/interrupt"))
+      (should (equal (plist-get args :type) "POST"))
+      (should (null (plist-get args :data))))))
+
+;;; session-command
+
+(ert-deftest test-opencode-client/session-command-sends-name-and-text ()
+  "Commands post name and text arguments."
+  (let ((conn (opencode-client-test--connection "/tmp/project/")))
+    (opencode-client-test--with-captured-request url args
+      (opencode-client-session-command conn "ses_1" "commit" "all"
+                                       :success #'ignore :error #'ignore)
+      (should (equal url "http://127.0.0.1:4096/api/session/ses_1/command"))
       (should (equal (plist-get args :data)
-                     (json-encode '((providerID . "anthropic")
-                                    (modelID . "claude")
-                                    (auto . :json-false))))))))
+                     (json-encode '((name . "commit")
+                                    (text . "all"))))))))
+
+(ert-deftest test-opencode-client/session-command-sends-agent ()
+  "A command agent is sent as an agent attachment."
+  (let ((conn (opencode-client-test--connection "/tmp/project/")))
+    (opencode-client-test--with-captured-request _url args
+      (opencode-client-session-command conn "ses_1" "commit" ""
+                                       :agent "plan"
+                                       :success #'ignore :error #'ignore)
+      (should (equal (plist-get args :data)
+                     (json-encode '((name . "commit")
+                                    (text . "")
+                                    (agents . (((name . "plan")))))))))))
+
+;;; session-shell
+
+(ert-deftest test-opencode-client/session-shell-sends-command ()
+  "Shell execution posts only the command."
+  (let ((conn (opencode-client-test--connection "/tmp/project/")))
+    (opencode-client-test--with-captured-request url args
+      (opencode-client-session-shell conn "ses_1" "ls"
+                                     :success #'ignore :error #'ignore)
+      (should (equal url "http://127.0.0.1:4096/api/session/ses_1/shell"))
+      (should (equal (plist-get args :data)
+                     (json-encode '((command . "ls"))))))))
+
+;;; form-reply
+
+(ert-deftest test-opencode-client/form-reply-sends-answer ()
+  "Form replies post the answer map."
+  (let ((conn (opencode-client-test--connection "/tmp/project/")))
+    (opencode-client-test--with-captured-request url args
+      (opencode-client-form-reply conn "ses_1" "frm_1" '((color . "red"))
+                                  :success #'ignore :error #'ignore)
+      (should (equal url (concat "http://127.0.0.1:4096"
+                                 "/api/session/ses_1/form/frm_1/reply")))
+      (should (equal (plist-get args :data)
+                     (json-encode '((answer . ((color . "red"))))))))))
+
+(ert-deftest test-opencode-client/form-cancel-deletes-form ()
+  "Form cancellation deletes the form."
+  (let ((conn (opencode-client-test--connection "/tmp/project/")))
+    (opencode-client-test--with-captured-request url args
+      (opencode-client-form-cancel conn "ses_1" "frm_1"
+                                   :success #'ignore :error #'ignore)
+      (should (equal url (concat "http://127.0.0.1:4096"
+                                 "/api/session/ses_1/form/frm_1")))
+      (should (equal (plist-get args :type) "DELETE")))))
+
+;;; integration-connect
+
+(ert-deftest test-opencode-client/integrations-list ()
+  "Integration listing hits the v2 endpoint."
+  (let ((conn (opencode-client-test--connection "/tmp/project/")))
+    (opencode-client-test--with-captured-request url args
+      (opencode-client-integrations conn :success #'ignore :error #'ignore)
+      (should (equal url "http://127.0.0.1:4096/api/integration"))
+      (should (equal (plist-get args :type) "GET")))))
+
+(ert-deftest test-opencode-client/integration-connect-key ()
+  "Key connect posts the key."
+  (let ((conn (opencode-client-test--connection "/tmp/project/")))
+    (opencode-client-test--with-captured-request url args
+      (opencode-client-integration-connect-key conn "anthropic" "sk-x"
+                                               :success #'ignore :error #'ignore)
+      (should (equal url (concat "http://127.0.0.1:4096"
+                                 "/api/integration/anthropic/connect/key")))
+      (should (equal (plist-get args :data)
+                     (json-encode '((key . "sk-x"))))))))
+
+(ert-deftest test-opencode-client/integration-oauth-begin ()
+  "OAuth begin posts the method ID."
+  (let ((conn (opencode-client-test--connection "/tmp/project/")))
+    (opencode-client-test--with-captured-request url args
+      (opencode-client-integration-oauth-begin conn "openai" "chatgpt-browser"
+                                               :success #'ignore :error #'ignore)
+      (should (equal url (concat "http://127.0.0.1:4096"
+                                 "/api/integration/openai/connect/oauth")))
+      (should (equal (plist-get args :data)
+                     (json-encode '((methodID . "chatgpt-browser"))))))))
+
+(ert-deftest test-opencode-client/integration-oauth-status ()
+  "OAuth status polls the attempt."
+  (let ((conn (opencode-client-test--connection "/tmp/project/")))
+    (opencode-client-test--with-captured-request url args
+      (opencode-client-integration-oauth-status conn "openai" "con_1"
+                                                :success #'ignore :error #'ignore)
+      (should (equal url (concat "http://127.0.0.1:4096"
+                                 "/api/integration/openai/connect/oauth/con_1")))
+      (should (equal (plist-get args :type) "GET")))))
+
+(ert-deftest test-opencode-client/integration-oauth-complete ()
+  "OAuth complete posts the code."
+  (let ((conn (opencode-client-test--connection "/tmp/project/")))
+    (opencode-client-test--with-captured-request url args
+      (opencode-client-integration-oauth-complete conn "openai" "con_1"
+                                                  :code "abc"
+                                                  :success #'ignore :error #'ignore)
+      (should (equal url (concat "http://127.0.0.1:4096"
+                                 "/api/integration/openai/connect/oauth/con_1/complete")))
+      (should (equal (plist-get args :data)
+                     (json-encode '((code . "abc"))))))))
 
 ;;; format-error
 
@@ -243,69 +366,6 @@ last `request' call made during BODY."
 (ert-deftest test-opencode-client/format-error-nil-without-detail ()
   "Return nil when no detail is available."
   (should (null (opencode-client-format-error nil))))
-
-;;; vectorize-answers
-
-(ert-deftest test-opencode-client/vectorize-answers-list-of-lists ()
-  "Convert list of lists to vector of vectors."
-  (let ((result (opencode--vectorize-answers '(("a" "b") ("c")))))
-    (should (vectorp result))
-    (should (= (length result) 2))
-    (should (vectorp (aref result 0)))
-    (should (equal (aref result 0) ["a" "b"]))
-    (should (equal (aref result 1) ["c"]))))
-
-(ert-deftest test-opencode-client/vectorize-answers-vector-input ()
-  "Handle vector input."
-  (let ((result (opencode--vectorize-answers [("a") ("b")])))
-    (should (vectorp result))
-    (should (= (length result) 2))))
-
-(ert-deftest test-opencode-client/vectorize-answers-strings ()
-  "Wrap plain strings in vectors."
-  (let ((result (opencode--vectorize-answers '("hello" "world"))))
-    (should (vectorp result))
-    (should (equal (aref result 0) ["hello"]))
-    (should (equal (aref result 1) ["world"]))))
-
-(ert-deftest test-opencode-client/vectorize-answers-mixed ()
-  "Handle mixed input types."
-  (let ((result (opencode--vectorize-answers '(["a"] ("b") "c"))))
-    (should (vectorp result))
-    (should (equal (aref result 0) ["a"]))
-    (should (equal (aref result 1) ["b"]))
-    (should (equal (aref result 2) ["c"]))))
-
-(ert-deftest test-opencode-client/vectorize-answers-nil ()
-  "Handle nil input."
-  (let ((result (opencode--vectorize-answers nil)))
-    (should (vectorp result))
-    (should (= (length result) 0))))
-
-;;; permission-reply
-
-(ert-deftest test-opencode-client/permission-reply-session-scoped ()
-  "A session-scoped reply posts a decision to the v2 endpoint."
-  (let ((conn (opencode-client-test--connection "/tmp/project/")))
-    (opencode-client-test--with-captured-request url args
-      (opencode-client-permission-reply
-       conn "per_1" "once" :session-id "ses_1"
-       :success #'ignore :error #'ignore)
-      (should (equal url (concat "http://127.0.0.1:4096"
-                                 "/api/session/ses_1/permission/per_1/reply")))
-      (should (equal (plist-get args :type) "POST"))
-      (should (equal (plist-get args :data)
-                     (json-encode '((decision . "once"))))))))
-
-(ert-deftest test-opencode-client/permission-reply-legacy-without-session ()
-  "Without a session ID the legacy reply path is used."
-  (let ((conn (opencode-client-test--connection "/tmp/project/")))
-    (opencode-client-test--with-captured-request url args
-      (opencode-client-permission-reply
-       conn "per_1" "reject" :success #'ignore :error #'ignore)
-      (should (equal url "http://127.0.0.1:4096/permission/per_1/reply"))
-      (should (equal (plist-get args :data)
-                     (json-encode '((reply . "reject"))))))))
 
 (provide 'emacs-opencode-client-test)
 

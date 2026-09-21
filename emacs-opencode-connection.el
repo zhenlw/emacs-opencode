@@ -2,8 +2,10 @@
 
 (require 'cl-lib)
 (require 'subr-x)
+(require 'emacs-opencode-session-vars)
 
 (declare-function opencode-client-commands "emacs-opencode-client" (conn &key success error))
+(declare-function opencode-client-models "emacs-opencode-client" (conn &key success error))
 (declare-function opencode-client-providers "emacs-opencode-client" (conn &key success error))
 
 (cl-defstruct (opencode-connection (:constructor opencode-connection-create))
@@ -158,32 +160,112 @@ ON-SUCCESS is called with ITEMS when available. ON-ERROR is called on failure."
                     (funcall on-error)
                   (message "OpenCode: failed to load commands"))))))))
 
+(defun opencode-connection--provider-items (data)
+  "Return the provider list from a provider payload DATA.
+Accepts the v2 `{data: [...]}` envelope and the v1 `{all: [...]}` shape."
+  (opencode-session--normalize-items
+   (or (alist-get 'data data) (alist-get 'all data))))
+
+(defun opencode-connection--attach-models (connection items on-success)
+  "Attach model entries to ITEMS for CONNECTION, then cache and finish.
+Models come from a separate v2 endpoint, so fetch them and group by
+provider ID.  ON-SUCCESS is called with ITEMS once cached."
+  (opencode-client-models
+   connection
+   :success (lambda (&rest args)
+              (let* ((data (plist-get args :data))
+                     (models (opencode-session--normalize-items
+                              (or (alist-get 'data data)
+                                  (alist-get 'all data))))
+                     (by-provider (make-hash-table :test 'equal))
+                     (connected nil))
+                (dolist (info models)
+                  (let ((provider-id (alist-get 'providerID info))
+                        (model-id (alist-get 'modelID info)))
+                    (when (and (stringp provider-id) (stringp model-id))
+                      (push (cons model-id info)
+                            (gethash provider-id by-provider))
+                      (when (eq (alist-get 'enabled info) t)
+                        (cl-pushnew provider-id connected :test #'string=)))))
+                (setq items
+                      (mapcar (lambda (provider)
+                                (if (not (listp provider))
+                                    provider
+                                  (let ((cell (assoc 'models provider))
+                                        (group (gethash (alist-get 'id provider)
+                                                        by-provider)))
+                                    (if cell
+                                        (progn (setcdr cell group) provider)
+                                      (append provider
+                                              (list (cons 'models group)))))))
+                              items))
+                (setf (opencode-connection-providers connection) items)
+                (setf (opencode-connection-provider-catalog connection)
+                      `((all . ,items) (connected . ,connected)))
+                (when on-success
+                  (funcall on-success items))))
+   :error (lambda (&rest _args)
+            ;; Cache providers without models so callers do not retry.
+            (setf (opencode-connection-providers connection) items)
+            (setf (opencode-connection-provider-catalog connection)
+                  `((all . ,items) (connected . nil)))
+            (when on-success
+              (funcall on-success items)))))
+
+(defun opencode-connection-providers-changed (connection)
+  "Refresh cached providers for CONNECTION after a catalog change.
+Clears any empty/error marker and refetches immediately, unless a
+fetch is already in flight.  Called on the server's `provider.updated'
+and `model.updated' events."
+  (when (and connection
+             (not (eq (opencode-connection-providers connection) :loading)))
+    (setf (opencode-connection-providers connection) nil)
+    (setf (opencode-connection-provider-catalog connection) nil)
+    (opencode-connection-ensure-providers connection)))
+
 (defun opencode-connection-ensure-providers (connection &optional on-success on-error)
   "Ensure providers are fetched and cached for CONNECTION.
 
-ON-SUCCESS is called with ITEMS when available. ON-ERROR is called on failure."
+ON-SUCCESS is called with ITEMS when available. ON-ERROR is called on failure.
+An empty or failed response latches `:unavailable' so background
+callers (e.g. header renders) cannot hot-loop.  The latch clears on
+the server's catalog events or on an explicit refresh."
   (require 'emacs-opencode-client)
   (let ((providers (opencode-connection-providers connection)))
     (cond
      ((and providers (or (vectorp providers) (listp providers)))
       (when on-success (funcall on-success providers))
       providers)
-     ((eq providers :loading) nil)
+     ((memq providers '(:loading :unavailable)) nil)
      (t
       (setf (opencode-connection-providers connection) :loading)
       (setf (opencode-connection-provider-catalog connection) :loading)
       (opencode-client-providers
        connection
        :success (lambda (&rest args)
-                  (let* ((data (plist-get args :data))
-                         (items (alist-get 'all data)))
-                     (setf (opencode-connection-providers connection) items)
-                     (setf (opencode-connection-provider-catalog connection) data)
-                     (when on-success
-                       (funcall on-success items))))
+                  (let ((items (opencode-connection--provider-items
+                                (plist-get args :data))))
+                    (if items
+                        (opencode-connection--attach-models
+                         connection items on-success)
+                      ;; Latch empty until a catalog event or explicit
+                      ;; refresh.  Include the payload keys to aid diagnosis.
+                      (setf (opencode-connection-providers connection)
+                            :unavailable)
+                      (setf (opencode-connection-provider-catalog connection)
+                            :unavailable)
+                      (if on-error
+                          (funcall on-error)
+                        (let ((payload (plist-get args :data)))
+                          (message "OpenCode: no providers available%s"
+                                   (if (listp payload)
+                                       (format " (response keys: %s)"
+                                               (mapcar #'car payload))
+                                     "")))))))
        :error (lambda (&rest _args)
-                 (setf (opencode-connection-providers connection) nil)
-                 (setf (opencode-connection-provider-catalog connection) nil)
+                 (setf (opencode-connection-providers connection) :unavailable)
+                 (setf (opencode-connection-provider-catalog connection)
+                       :unavailable)
                  (if on-error
                      (funcall on-error)
                    (message "OpenCode: failed to load providers"))))))))

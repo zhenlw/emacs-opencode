@@ -155,54 +155,6 @@
                  '((permission . "custom")))))
     (should (string-match-p "use custom" result))))
 
-;;; question helpers
-
-(ert-deftest test-opencode-handlers/question-list-vector ()
-  "Normalize question vector."
-  (should (equal (opencode-session--question-list [1 2]) '(1 2))))
-
-(ert-deftest test-opencode-handlers/question-list-nil ()
-  "Return nil for nil."
-  (should (null (opencode-session--question-list nil))))
-
-(ert-deftest test-opencode-handlers/question-options ()
-  "Extract option labels."
-  (should (equal (opencode-session--question-options
-                  '((options . [((label . "Yes")) ((label . "No"))])))
-                 '("Yes" "No"))))
-
-(ert-deftest test-opencode-handlers/question-multiple-p-true ()
-  "Detect multiple-answer questions."
-  (should (opencode-session--question-multiple-p '((multiple . t)))))
-
-(ert-deftest test-opencode-handlers/question-multiple-p-false ()
-  "Non-multiple returns nil."
-  (should (null (opencode-session--question-multiple-p '((multiple . nil))))))
-
-(ert-deftest test-opencode-handlers/question-custom-p-true ()
-  "Detect custom-answer questions."
-  (should (opencode-session--question-custom-p '((custom . t)))))
-
-(ert-deftest test-opencode-handlers/question-custom-p-false ()
-  "Non-custom returns nil."
-  (should (null (opencode-session--question-custom-p '((custom . :json-false))))))
-
-(ert-deftest test-opencode-handlers/question-custom-p-nil ()
-  "Nil custom returns nil."
-  (should (null (opencode-session--question-custom-p '((custom . nil))))))
-
-(ert-deftest test-opencode-handlers/question-prompt-label ()
-  "Build question prompt."
-  (should (equal (opencode-session--question-prompt-label
-                  '((header . "Auth") (question . "Enter key")))
-                 "OpenCode Auth: Enter key ")))
-
-(ert-deftest test-opencode-handlers/question-prompt-label-no-header ()
-  "Build question prompt without header."
-  (should (equal (opencode-session--question-prompt-label
-                  '((question . "Choose one")))
-                 "OpenCode: Choose one ")))
-
 ;;; event-file-paths
 
 (ert-deftest test-opencode-handlers/compaction-started-renders-marker ()
@@ -277,7 +229,7 @@
   (should (null (opencode-session--event-file-paths
                  '((properties . ((other . "x"))))))))
 
-;;; permission/question reply routing by connection
+;;; permission reply routing by connection
 
 (defmacro opencode-handlers-test--with-sync-timer (&rest body)
   "Evaluate BODY with `run-at-time' running its function synchronously.
@@ -341,28 +293,6 @@ reply must go to the originating connection, not an arbitrary buffer."
          (list :connection event-conn))))
     (should (equal replied-conn (cons event-conn "always")))))
 
-(ert-deftest test-opencode-handlers/question-reply-routes-to-event-connection ()
-  "A subagent question reply is sent via the connection that asked."
-  (let ((opencode-session--buffers (make-hash-table :test 'equal))
-        (event-conn 'conn-asking)
-        (replied-conn :unset)
-        (replied-id :unset))
-    (cl-letf (((symbol-function 'opencode-session--question-answers)
-               (lambda (&rest _) '(("Yes"))))
-              ((symbol-function 'opencode-client-question-reply)
-               (lambda (conn request-id _answers &rest _args)
-                 (setq replied-conn conn
-                       replied-id request-id))))
-      (opencode-handlers-test--with-sync-timer
-        (opencode-session--handle-question-asked
-         "question.asked"
-         '((properties . ((id . "qst_789")
-                           (sessionID . "sub_agent_session")
-                           (questions . [((question . "Pick") (options . [((label . "Yes"))]))]))))
-         (list :connection event-conn))))
-    (should (eq replied-conn event-conn))
-    (should (equal replied-id "qst_789"))))
-
 ;;; Cross-client prompt resolution
 
 (ert-deftest test-opencode-handlers/resolved-before-timer-skips-prompt ()
@@ -398,11 +328,11 @@ reply must go to the originating connection, not an arbitrary buffer."
                (lambda (&rest _args)
                  (setq timer-count (1+ timer-count)))))
       (dotimes (_ 2)
-        (opencode-session--handle-question-asked
-         "question.asked"
-         '((properties . ((id . "que_duplicate")
+        (opencode-session--handle-permission-asked
+         "permission.asked"
+         '((properties . ((id . "per_duplicate")
                           (sessionID . "session")
-                          (questions . []))))
+                          (permission . "read"))))
          (list :connection connection))))
     (should (= timer-count 1))))
 
@@ -432,33 +362,6 @@ reply must go to the originating connection, not an arbitrary buffer."
                           (permission . "read"))))
          (list :connection connection))))
     (should (= reply-count 0))))
-
-(ert-deftest test-opencode-handlers/remote-question-rejection-dismisses-prompt ()
-  "A remote question rejection aborts the prompt without rejecting again."
-  (let ((opencode-session--pending-prompts (make-hash-table :test #'eq))
-        (connection 'conn)
-        (reject-count 0))
-    (cl-letf (((symbol-function 'opencode-session--question-answers)
-               (lambda (&rest _args)
-                 (opencode-session--handle-prompt-resolved
-                  "question.rejected"
-                  '((properties . ((requestID . "que_remote"))))
-                  (list :connection connection))))
-              ((symbol-function 'opencode-session--prompt-active-p)
-               (lambda (_state) t))
-              ((symbol-function 'abort-recursive-edit)
-               (lambda () (signal 'quit nil)))
-              ((symbol-function 'opencode-client-question-reject)
-               (lambda (&rest _args)
-                 (setq reject-count (1+ reject-count)))))
-      (opencode-handlers-test--with-sync-timer
-        (opencode-session--handle-question-asked
-         "question.asked"
-         '((properties . ((id . "que_remote")
-                          (sessionID . "session")
-                          (questions . []))))
-         (list :connection connection))))
-    (should (= reject-count 0))))
 
 (ert-deftest test-opencode-handlers/resolution-does-not-abort-other-prompt ()
   "Resolving one request does not abort a different active prompt."
@@ -517,25 +420,6 @@ reply must go to the originating connection, not an arbitrary buffer."
                           (permission . "read"))))
          (list :connection connection))))
     (should (equal reply "reject"))))
-
-(ert-deftest test-opencode-handlers/user-quit-still-rejects-question ()
-  "Quitting a question prompt still calls the rejection endpoint."
-  (let ((opencode-session--pending-prompts (make-hash-table :test #'eq))
-        (connection 'conn)
-        (rejected nil))
-    (cl-letf (((symbol-function 'opencode-session--question-answers)
-               (lambda (&rest _args) (signal 'quit nil)))
-              ((symbol-function 'opencode-client-question-reject)
-               (lambda (&rest _args)
-                 (setq rejected t))))
-      (opencode-handlers-test--with-sync-timer
-        (opencode-session--handle-question-asked
-         "question.asked"
-         '((properties . ((id . "que_quit")
-                          (sessionID . "session")
-                          (questions . []))))
-         (list :connection connection))))
-    (should rejected)))
 
 ;;; V2 streaming events
 
@@ -671,12 +555,57 @@ reply must go to the originating connection, not an arbitrary buffer."
     (cl-letf (((symbol-function 'completing-read)
                (lambda (&rest _) "Allow once"))
               ((symbol-function 'opencode-client-permission-reply)
-               (lambda (_conn _request-id value &rest args)
-                 (setq replied (cons value (plist-get args :session-id))))))
+               (lambda (_conn _request-id value session-id &rest _args)
+                 (setq replied (cons value session-id)))))
       (opencode-handlers-test--with-sync-timer
         (opencode-session--handle-permission-asked
          "permission.asked" payload (list :connection 'conn))))
     (should (equal replied '("once" . "s1")))))
+
+;;; catalog change events
+
+(ert-deftest test-opencode-handlers/provider-updated-refetches ()
+  "A provider.updated event refreshes a latched-empty cache."
+  (let ((conn (opencode-connection-create :directory "/tmp/"))
+        (calls 0))
+    (cl-letf (((symbol-function 'opencode-client-providers)
+               (lambda (_conn &rest args)
+                 (setq calls (1+ calls))
+                 (funcall (plist-get args :success) :data '((data . [])))))
+              ((symbol-function 'opencode-client-models)
+               (lambda (_conn &rest _args) nil)))
+      (opencode-connection-ensure-providers conn #'ignore #'ignore)
+      (should (= calls 1))
+      (opencode-sse--provider-updated-handler
+       "provider.updated" '((type . "provider.updated"))
+       (list :connection conn))
+      (should (= calls 2)))))
+
+(ert-deftest test-opencode-handlers/v2-form-reply-sends-answer ()
+  "A form.created prompt answers option fields and replies."
+  (let ((opencode-session--buffers (make-hash-table :test 'equal))
+        (opencode-session--pending-prompts (make-hash-table :test #'eq))
+        (replied nil)
+        (payload (list (cons 'properties
+                              (list (cons 'form
+                                          (list (cons 'id "frm_1")
+                                                (cons 'sessionID "s1")
+                                                (cons 'title "Pick")
+                                                (cons 'fields
+                                                      (list (list (cons 'key "color")
+                                                                  (cons 'type "string")
+                                                                  (cons 'options
+                                                                        (list (list (cons 'value "red")
+                                                                                    (cons 'label "Red"))))))))))))))
+    (cl-letf (((symbol-function 'completing-read)
+               (lambda (&rest _) "Red"))
+              ((symbol-function 'opencode-client-form-reply)
+               (lambda (_conn session-id form-id answer &rest _args)
+                 (setq replied (list session-id form-id answer)))))
+      (opencode-handlers-test--with-sync-timer
+        (opencode-session--handle-form-created
+         "form.created" payload (list :connection 'conn))))
+    (should (equal replied '("s1" "frm_1" ((color . "red")))))))
 
 (provide 'emacs-opencode-session-handlers-test)
 

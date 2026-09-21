@@ -36,6 +36,32 @@
   (let ((data '(((name . "plan") (mode . "primary")))))
     (should (equal (opencode-session--normalize-agents data) '("plan")))))
 
+(ert-deftest test-opencode-model/normalize-agents-v2-envelope ()
+  "Unwrap a v2 {data: [...]} agent envelope."
+  (let ((data (list (list (cons 'location "x"))
+                    (cons 'data
+                          (list (list (cons 'id "plan")
+                                      (cons 'mode "primary")))))))
+    (should (equal (opencode-session--normalize-agents data) '("plan")))))
+
+(ert-deftest test-opencode-model/maybe-fetch-agents-caches-once ()
+  "An agent fetch caches results instead of refiring."
+  (let ((conn (opencode-connection-create :directory "/tmp/"))
+        (calls 0))
+    (cl-letf (((symbol-function 'opencode-client-agents)
+               (lambda (_conn &rest args)
+                 (setq calls (1+ calls))
+                 (funcall (plist-get args :success)
+                          :data (list (cons 'data
+                                            (list (list (cons 'id "plan")
+                                                        (cons 'mode
+                                                              "primary")))))))))
+      (opencode-session--maybe-fetch-agents conn)
+      (should (= calls 1))
+      (should (equal (opencode-connection-agents conn) '("plan")))
+      (opencode-session--maybe-fetch-agents conn)
+      (should (= calls 1)))))
+
 ;;; variant-keys
 
 (ert-deftest test-opencode-model/variant-keys-alist ()
@@ -75,6 +101,19 @@
                  '((fast . nil) (slow . nil)))))
     (should (member "fast" result))
     (should (member "slow" result))))
+
+(ert-deftest test-opencode-model/variant-keys-vector ()
+  "Extract v2 variant ids from a vector of info objects."
+  (let ((result (opencode-session--variant-keys
+                 `[((id . "fast")) ((id . "slow"))])))
+    (should (equal result '("fast" "slow")))))
+
+(ert-deftest test-opencode-model/variant-keys-v2-list ()
+  "Extract v2 variant ids from a decoded list of info objects."
+  (let ((result (opencode-session--variant-keys
+                 '(((id . "low") (settings . nil))
+                   ((id . "high") (settings . nil))))))
+    (should (equal result '("high" "low")))))
 
 ;;; model-candidate-tier
 
@@ -218,20 +257,132 @@
   "Return nil for nil."
   (should (null (opencode-session--agent-name nil))))
 
-;;; provider-auth-methods
+;;; integration-methods
 
-(ert-deftest test-opencode-model/provider-auth-methods ()
-  "Extract auth methods for a provider."
-  (let ((data `((anthropic . [((type . "api") (label . "API key"))]))))
-    (let ((result (opencode-session--provider-auth-methods "anthropic" data)))
+(ert-deftest test-opencode-model/integration-methods ()
+  "Extract auth methods for a provider from an integration envelope."
+  (let* ((method (list (cons 'type "key")))
+         (integration (list (cons 'id "anthropic")
+                            (cons 'methods (list method))))
+         (data (list (cons 'data (list integration)))))
+    (let ((result (opencode-session--integration-methods "anthropic" data)))
       (should (= (length result) 1))
-      (should (equal (alist-get 'type (car result)) "api")))))
-
-(ert-deftest test-opencode-model/provider-auth-methods-fallback ()
-  "Fall back to API key when provider not found."
-  (let ((result (opencode-session--provider-auth-methods "unknown" nil)))
+      (should (equal (alist-get 'type (car result)) "key")))))
+(ert-deftest test-opencode-model/integration-methods-fallback ()
+  "Fall back to API key when the provider is unknown."
+  (let ((result (opencode-session--integration-methods "unknown" nil)))
     (should (= (length result) 1))
-    (should (equal (alist-get 'type (car result)) "api"))))
+    (should (equal (alist-get 'type (car result)) "key"))))
+
+(ert-deftest test-opencode-model/auth-method-display ()
+  "Display falls back to the method type without a label."
+  (should (equal (opencode-session--auth-method-display
+                  '((type . "key")))
+                 "key"))
+  (should (equal (opencode-session--auth-method-display
+                  '((type . "oauth") (label . "Login")))
+                 "Login (oauth)")))
+
+(ert-deftest test-opencode-model/auth-api-key-connects ()
+  "The key flow posts the key and refreshes on success."
+  (let ((posted nil)
+        (refreshed nil))
+    (cl-letf (((symbol-function 'opencode-client-integration-connect-key)
+               (lambda (_conn _id key &rest args)
+                 (setq posted key)
+                 (funcall (plist-get args :success))))
+              ((symbol-function 'opencode-session--post-connect-refresh)
+               (lambda (_conn callback) (setq refreshed t)))
+              ((symbol-function 'read-string)
+               (lambda (&rest _) "sk-test")))
+      (opencode-session--auth-api-key 'conn "anthropic"
+                                      '((type . "key")) #'ignore)
+      (should (equal posted "sk-test"))
+      (should refreshed))))
+
+(ert-deftest test-opencode-model/auth-oauth-code-completes ()
+  "A code-mode attempt completes with the entered code."
+  (let ((completed nil))
+    (cl-letf (((symbol-function 'opencode-client-integration-oauth-complete)
+               (lambda (_conn _id _attempt &rest args)
+                 (setq completed (plist-get args :code))
+                 (funcall (plist-get args :success))))
+              ((symbol-function 'opencode-session--post-connect-refresh)
+               (lambda (_conn _callback) nil))
+              ((symbol-function 'read-string)
+               (lambda (&rest _) "authcode123")))
+      (opencode-session--auth-oauth-code 'conn "openai" "con_1" #'ignore)
+      (should (equal completed "authcode123")))))
+
+;;; v2 provider flow
+
+(defun opencode-model-test--v2-providers (_conn &rest args)
+  "Stub `opencode-client-providers' with a v2 envelope."
+  (funcall (plist-get args :success)
+           :data (list (cons 'data
+                             (list (list (cons 'id "google")
+                                         (cons 'name "Google")))))))
+
+(defun opencode-model-test--v2-models (_conn &rest args)
+  "Stub `opencode-client-models' with a v2 envelope."
+  (funcall (plist-get args :success)
+           :data (list (cons 'data
+                             (list (list (cons 'providerID "google")
+                                         (cons 'modelID "gemini-x")
+                                         (cons 'name "Gemini X")
+                                         (cons 'enabled t)
+                                         (cons 'status "active")
+                                         (cons 'variants
+                                               (list (list (cons 'id "low"))
+                                                     (list (cons 'id "high"))))))))))
+
+(ert-deftest test-opencode-model/v2-flow-builds-candidates ()
+  "A v2 provider+model fetch yields selectable candidates."
+  (let ((conn (opencode-connection-create :directory "/tmp/")))
+    (cl-letf (((symbol-function 'opencode-client-providers)
+               #'opencode-model-test--v2-providers)
+              ((symbol-function 'opencode-client-models)
+               #'opencode-model-test--v2-models)
+              ((symbol-function 'opencode-session--session-used-models)
+               #'ignore))
+      (opencode-connection-ensure-providers conn #'ignore #'ignore)
+      (let ((data (opencode-session--provider-model-completion-data conn)))
+        (should (member "google/gemini-x (connected)" (car data))))
+      (with-temp-buffer
+        (setq-local opencode-session--connection conn)
+        (setq-local opencode-session--provider-id "google")
+        (setq-local opencode-session--model-id "gemini-x")
+        (should (equal (opencode-session--available-variants)
+                       '("high" "low")))))))
+
+(ert-deftest test-opencode-model/prompt-model-selection-applies ()
+  "The extracted model prompt applies a connected selection."
+  (let ((conn (opencode-connection-create :directory "/tmp/")))
+    (cl-letf (((symbol-function 'opencode-client-providers)
+               #'opencode-model-test--v2-providers)
+              ((symbol-function 'opencode-client-models)
+               #'opencode-model-test--v2-models)
+              ((symbol-function 'opencode-session--session-used-models)
+               #'ignore)
+              ((symbol-function 'completing-read)
+               (lambda (&rest _) "google/gemini-x (connected)"))
+              ((symbol-function 'opencode-session--render-header)
+               #'ignore))
+      (opencode-connection-ensure-providers conn #'ignore #'ignore)
+      (with-temp-buffer
+        (setq-local opencode-session--connection conn)
+        (opencode-session--prompt-model-selection (current-buffer))
+        (should (equal opencode-session--provider-id "google"))
+        (should (equal opencode-session--model-id "gemini-x"))))))
+
+(ert-deftest test-opencode-model/wait-for-load-fires-when-ready ()
+  "The load waiter calls back once the readiness check passes."
+  (let (fired)
+    (opencode-session--wait-for-load (lambda () t)
+                                     (lambda () (setq fired t))
+                                     "test")
+    (sit-for 0.6)
+    (should fired)))
 
 (provide 'emacs-opencode-session-model-test)
 

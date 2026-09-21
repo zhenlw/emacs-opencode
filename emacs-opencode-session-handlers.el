@@ -25,6 +25,8 @@
 (declare-function opencode-session--register-subagent "emacs-opencode-session-mode")
 (declare-function opencode-session--buffer-name "emacs-opencode-session-mode")
 (declare-function opencode-session--rename-buffer "emacs-opencode-session-mode")
+(declare-function opencode-session--agents-changed "emacs-opencode-session-model"
+                  (connection))
 
 (cl-defstruct (opencode-session--prompt-state
                (:constructor opencode-session--prompt-state-create))
@@ -92,7 +94,8 @@ Return its new state, or nil when it is already registered."
 (defun opencode-session--handle-prompt-resolved (_event data meta)
   "Handle a prompt completion SSE DATA arriving with META."
   (let* ((properties (alist-get 'properties data))
-         (request-id (alist-get 'requestID properties))
+         (request-id (or (alist-get 'requestID properties)
+                         (alist-get 'id properties)))
          (connection (plist-get meta :connection))
          (table (opencode-session--prompt-table connection))
          (state (and table (gethash request-id table))))
@@ -102,6 +105,150 @@ Return its new state, or nil when it is already registered."
       (when (opencode-session--prompt-active-p state)
         (message "OpenCode request answered in another client")
         (abort-recursive-edit)))))
+
+;;; Form handling (v2 replacement for questions)
+
+(defun opencode-session--form-fields (form)
+  "Normalize the field list of FORM into a list."
+  (let ((fields (alist-get 'fields form)))
+    (cond
+     ((vectorp fields) (append fields nil))
+     ((listp fields) fields)
+     (t nil))))
+
+(defun opencode-session--form-option-labels (field)
+  "Return an alist of (LABEL . VALUE) for FIELD options."
+  (delq nil
+        (mapcar (lambda (option)
+                  (when (listp option)
+                    (cons (or (alist-get 'label option)
+                              (alist-get 'value option))
+                          (alist-get 'value option))))
+                (opencode-session--normalize-items
+                 (alist-get 'options field)))))
+
+(defun opencode-session--form-read-field (field)
+  "Prompt for FIELD and return (KEY . VALUE), or nil to skip.
+Hidden fields are skipped; the server falls back to their default."
+  (let ((key (alist-get 'key field)))
+    (when (and (stringp key) (not (alist-get 'hidden field)))
+      (let* ((title (or (alist-get 'title field) key))
+             (description (alist-get 'description field))
+             (prompt (if (and (stringp description)
+                              (not (string-empty-p description)))
+                         (format "OpenCode %s (%s): " title description)
+                       (format "OpenCode %s: " title)))
+             (type (alist-get 'type field))
+             (choices (opencode-session--form-option-labels field))
+             (custom (alist-get 'custom field))
+             (required (alist-get 'required field))
+             (default (alist-get 'default field)))
+        (let ((value
+               (cond
+                ((string= type "boolean")
+                 (if (y-or-n-p prompt) t :json-false))
+                ((member type '("number" "integer"))
+                 (read-number prompt (and (numberp default) default)))
+                ((string= type "multiselect")
+                 (let* ((labels (mapcar #'car choices))
+                        (all (if custom (append labels '("Other")) labels))
+                        (selection (completing-read-multiple
+                                    prompt all nil (not custom))))
+                   (append (delq nil
+                                 (mapcar (lambda (label)
+                                           (cdr (assoc label choices)))
+                                         (remove "Other" selection)))
+                           (when (and custom (member "Other" selection))
+                             (list (read-string (concat prompt "(Other): ")))))))
+                (choices
+                 (let* ((labels (mapcar #'car choices))
+                        (all (if custom (append labels '("Other")) labels))
+                        (selection (completing-read
+                                    prompt all nil (not custom) nil nil
+                                    (and (stringp default) default))))
+                   (if (and custom (string= selection "Other"))
+                       (read-string (concat prompt "(Other): "))
+                     (cdr (assoc selection choices)))))
+                (t
+                 (read-string prompt nil nil
+                              (and (stringp default) default))))))
+          (when (and required
+                     (or (null value)
+                         (and (stringp value) (string-empty-p value))
+                         (and (listp value) (null value))))
+            (error "OpenCode: %s is required" key))
+          (cons (intern key) value))))))
+
+(defun opencode-session--prompt-form (form connection state)
+  "Prompt for FORM fields and send the answer via CONNECTION.
+STATE tracks whether another client resolves the request."
+  (let* ((form-id (alist-get 'id form))
+         (session-id (alist-get 'sessionID form))
+         (title (alist-get 'title form))
+         (answer
+          (let ((opencode-session--active-prompt state))
+            (condition-case nil
+                (minibuffer-with-setup-hook
+                    (lambda ()
+                      (setq-local opencode-session--minibuffer-prompt state))
+                  (when title
+                    (message "OpenCode: %s" title))
+                  (delq nil
+                        (mapcar #'opencode-session--form-read-field
+                                (opencode-session--form-fields form))))
+              (quit (unless (eq (opencode-session--prompt-state-status state)
+                                'resolved)
+                      :cancel))))))
+    (unless connection
+      (error "OpenCode session is not connected"))
+    (unless form-id
+      (error "OpenCode form request is missing ID"))
+    (unless session-id
+      (error "OpenCode form request is missing session ID"))
+    (unless (eq (opencode-session--prompt-state-status state) 'resolved)
+      (setf (opencode-session--prompt-state-status state) 'answered)
+      (opencode-session--remove-prompt state)
+      (if (eq answer :cancel)
+          (opencode-client-form-cancel
+           connection
+           session-id
+           form-id
+           :success (lambda (&rest _args)
+                      (message "OpenCode form cancelled"))
+           :error (lambda (&rest _args)
+                    (message "OpenCode: failed to cancel form")))
+        (opencode-client-form-reply
+         connection
+         session-id
+         form-id
+         answer
+         :success (lambda (&rest _args)
+                    (message "OpenCode form reply sent"))
+         :error (lambda (&rest _args)
+                  (message "OpenCode: failed to reply to form")))))))
+
+(defun opencode-session--handle-form-created (_event data meta)
+  "Handle a form.created SSE DATA arriving with META.
+Routes and defers on a timer so `completing-read' does
+not block the process filter."
+  (let* ((form (alist-get 'form (alist-get 'properties data)))
+         (session-id (alist-get 'sessionID form))
+         (connection (plist-get meta :connection))
+         (state (opencode-session--register-prompt
+                 connection (alist-get 'id form))))
+    (when state
+      (run-at-time 0 nil
+       (lambda ()
+         (when (eq (opencode-session--prompt-state-status state) 'pending)
+           (opencode-session--run-prompt
+            state
+            (lambda ()
+              (let ((buffer (or (opencode-session--buffer-for-session session-id)
+                                (opencode-session--any-live-session-buffer connection))))
+                (with-current-buffer (if (buffer-live-p buffer)
+                                         buffer
+                                       (current-buffer))
+                  (opencode-session--prompt-form form connection state)))))))))))
 
 ;;; Session event handlers
 
@@ -720,6 +867,8 @@ STATE tracks whether another client resolves the request."
       (error "OpenCode session is not connected"))
     (unless request-id
       (error "OpenCode permission request is missing ID"))
+    (unless session-id
+      (error "OpenCode permission request is missing session ID"))
     (unless (eq (opencode-session--prompt-state-status state) 'resolved)
       (setf (opencode-session--prompt-state-status state) 'answered)
       (opencode-session--remove-prompt state)
@@ -727,7 +876,7 @@ STATE tracks whether another client resolves the request."
        connection
        request-id
        reply
-       :session-id session-id
+       session-id
        :success (lambda (&rest _args)
                   (message "OpenCode permission reply sent"))
        :error (lambda (&rest _args)
@@ -772,147 +921,6 @@ does not block the process filter."
                   ;; No buffer to host the prompt, but we can still reply via
                   ;; the originating connection.
                   (opencode-session--prompt-permission permission connection state)))))))))))
-
-;;; Question handling
-
-(defun opencode-session--question-list (questions)
-  "Normalize QUESTIONS into a list."
-  (cond
-   ((vectorp questions) (append questions nil))
-   ((listp questions) questions)
-   (t nil)))
-
-(defun opencode-session--question-options (question)
-  "Return option labels for QUESTION."
-  (let ((options (alist-get 'options question)))
-    (mapcar (lambda (option) (alist-get 'label option))
-            (opencode-session--normalize-items options))))
-
-(defun opencode-session--question-multiple-p (question)
-  "Return non-nil if QUESTION allows multiple answers."
-  (eq (alist-get 'multiple question) t))
-
-(defun opencode-session--question-custom-p (question)
-  "Return non-nil if QUESTION allows custom answers."
-  (let ((custom (alist-get 'custom question :missing)))
-    (not (or (eq custom :json-false)
-             (eq custom json-false)
-             (eq custom nil)))))
-
-(defun opencode-session--question-prompt-label (question)
-  "Return the minibuffer prompt label for QUESTION."
-  (let ((header (alist-get 'header question))
-        (text (alist-get 'question question)))
-    (if (and header (not (string-empty-p header)))
-        (format "OpenCode %s: %s " header text)
-      (format "OpenCode: %s " text))))
-
-(defun opencode-session--question-read-custom (prompt)
-  "Read a custom answer using PROMPT."
-  (read-string (concat prompt "(Other): ")))
-
-(defun opencode-session--question-read-single (question)
-  "Prompt for a single answer to QUESTION.
-
-Returns a list containing one answer string."
-  (let* ((prompt (opencode-session--question-prompt-label question))
-         (options (opencode-session--question-options question))
-         (custom (opencode-session--question-custom-p question))
-         (choices (if custom (append options '("Other")) options))
-         (selection (completing-read prompt choices nil t)))
-    (if (and custom (string= selection "Other"))
-        (list (opencode-session--question-read-custom prompt))
-      (list selection))))
-
-(defun opencode-session--question-read-multiple (question)
-  "Prompt for multiple answers to QUESTION.
-
-Returns a list of answer strings."
-  (let* ((prompt (opencode-session--question-prompt-label question))
-         (options (opencode-session--question-options question))
-         (custom (opencode-session--question-custom-p question))
-         (choices (if custom (append options '("Other")) options))
-         (selection (completing-read-multiple prompt choices nil t)))
-    (if (and custom (member "Other" selection))
-        (let ((custom-answer (opencode-session--question-read-custom prompt)))
-          (append (remove "Other" selection) (list custom-answer)))
-      selection)))
-
-(defun opencode-session--question-answers (questions)
-  "Return answers for QUESTIONS via minibuffer prompts."
-  (mapcar (lambda (question)
-            (if (opencode-session--question-multiple-p question)
-                (opencode-session--question-read-multiple question)
-              (opencode-session--question-read-single question)))
-          questions))
-
-(defun opencode-session--prompt-question (payload connection state)
-  "Prompt for question PAYLOAD and send a response via CONNECTION.
-STATE tracks whether another client resolves the request."
-  (let* ((request-id (alist-get 'id payload))
-         (questions (opencode-session--question-list (alist-get 'questions payload)))
-         (answers
-          (let ((opencode-session--active-prompt state))
-            (condition-case nil
-                (minibuffer-with-setup-hook
-                    (lambda ()
-                      (setq-local opencode-session--minibuffer-prompt state))
-                  (opencode-session--question-answers questions))
-              (quit (unless (eq (opencode-session--prompt-state-status state)
-                                'resolved)
-                      :reject))))))
-    (unless connection
-      (error "OpenCode session is not connected"))
-    (unless request-id
-      (error "OpenCode question request is missing ID"))
-    (unless (eq (opencode-session--prompt-state-status state) 'resolved)
-      (setf (opencode-session--prompt-state-status state) 'answered)
-      (opencode-session--remove-prompt state)
-      (if (eq answers :reject)
-          (opencode-client-question-reject
-           connection
-           request-id
-           :success (lambda (&rest _args)
-                       (message "OpenCode question rejected"))
-           :error (lambda (&rest _args)
-                    (message "OpenCode: failed to reject question")))
-        (opencode-client-question-reply
-         connection
-         request-id
-         answers
-         :success (lambda (&rest _args)
-                    (message "OpenCode question reply sent"))
-         :error (lambda (&rest _args)
-                  (message "OpenCode: failed to reply to question")))))))
-
-(defun opencode-session--handle-question-asked (_event data meta)
-  "Handle the question.asked SSE DATA arriving with META.
-META is a plist carrying `:connection', the connection on which
-the event arrived; the reply is always routed back to that
-connection so multi-server setups respond to the correct server.
-
-Falls back to any live session buffer on the same connection when
-SESSION-ID is unknown, e.g. for questions originating from
-subagent sessions.  Defers to a timer so `completing-read' does
-not block the process filter."
-  (let* ((question (alist-get 'properties data))
-         (session-id (alist-get 'sessionID question))
-         (connection (plist-get meta :connection))
-         (state (opencode-session--register-prompt
-                 connection (alist-get 'id question))))
-    (when state
-      (run-at-time 0 nil
-       (lambda ()
-         (when (eq (opencode-session--prompt-state-status state) 'pending)
-           (opencode-session--run-prompt
-            state
-            (lambda ()
-              (let ((buffer (or (opencode-session--buffer-for-session session-id)
-                                (opencode-session--any-live-session-buffer connection))))
-                (if (and buffer (buffer-live-p buffer))
-                    (with-current-buffer buffer
-                      (opencode-session--prompt-question question connection state))
-                  (opencode-session--prompt-question question connection state)))))))))))
 
 ;;; File revert handling
 
@@ -1019,13 +1027,13 @@ Returns nil when PATH is not a string."
 (opencode-sse-define-handler permission-replied "permission.replied" (_event data meta)
   (opencode-session--handle-prompt-resolved _event data meta))
 
-(opencode-sse-define-handler question-asked "question.asked" (_event data meta)
-  (opencode-session--handle-question-asked _event data meta))
+(opencode-sse-define-handler form-created "form.created" (_event data meta)
+  (opencode-session--handle-form-created _event data meta))
 
-(opencode-sse-define-handler question-replied "question.replied" (_event data meta)
+(opencode-sse-define-handler form-replied "form.replied" (_event data meta)
   (opencode-session--handle-prompt-resolved _event data meta))
 
-(opencode-sse-define-handler question-rejected "question.rejected" (_event data meta)
+(opencode-sse-define-handler form-cancelled "form.cancelled" (_event data meta)
   (opencode-session--handle-prompt-resolved _event data meta))
 
 (opencode-sse-define-handler message-updated "message.updated" (_event data _meta)
@@ -1108,6 +1116,22 @@ Returns nil when PATH is not a string."
 
 (opencode-sse-define-handler compaction-v2-failed "session.compaction.failed" (_event data _meta)
   (opencode-session--handle-compaction-failed _event data))
+
+(opencode-sse-define-handler provider-updated "provider.updated" (_event _data meta)
+  (when-let* ((connection (plist-get meta :connection)))
+    (opencode-connection-providers-changed connection)))
+
+(opencode-sse-define-handler model-updated "model.updated" (_event _data meta)
+  (when-let* ((connection (plist-get meta :connection)))
+    (opencode-connection-providers-changed connection)))
+
+(opencode-sse-define-handler agent-updated "agent.updated" (_event _data meta)
+  (when-let* ((connection (plist-get meta :connection)))
+    (opencode-session--agents-changed connection)))
+
+(opencode-sse-define-handler integration-updated "integration.updated" (_event _data meta)
+  (when-let* ((connection (plist-get meta :connection)))
+    (opencode-connection-providers-changed connection)))
 
 (opencode-sse-define-handler filesystem-changed "filesystem.changed" (_event data _meta)
   (opencode-session--handle-file-updated _event data))

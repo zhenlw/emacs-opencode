@@ -13,6 +13,7 @@
 (declare-function opencode-session--maybe-start-spinner "emacs-opencode-session-header")
 (declare-function opencode-session--maybe-stop-spinner "emacs-opencode-session-header")
 (declare-function opencode-session--ensure-connection "emacs-opencode-session-mode" (callback))
+(declare-function opencode-session--form-read-field "emacs-opencode-session-handlers" (field))
 
 (defcustom opencode-session-default-agent "plan"
   "Default agent name for new OpenCode sessions."
@@ -41,9 +42,14 @@ Most recently selected first.")
 
 (defun opencode-session--normalize-agent-data (data)
   "Normalize raw agent DATA into a list of alists.
-Each element is an alist with at least `name' (or `id') and `mode' keys."
+Each element is an alist with at least `name' (or `id') and `mode' keys.
+Accepts a bare list/vector as well as a `{data: [...]}` envelope."
   (let ((agents (cond
                  ((vectorp data) (append data nil))
+                 ((and (listp data)
+                       (let ((cell (assoc 'data data)))
+                         (and cell (listp (cdr cell)))))
+                  (cdr (assoc 'data data)))
                  ((listp data) data)
                  (t nil))))
     (cl-remove-if-not (lambda (agent)
@@ -86,6 +92,7 @@ Includes non-hidden agents that are not in primary mode (i.e., subagents)."
 (defun opencode-session--maybe-fetch-agents (connection)
   "Fetch and cache agents for CONNECTION when needed."
   (unless (opencode-connection-agents connection)
+    (setf (opencode-connection-agents connection) :loading)
     (let ((session-buffer (current-buffer)))
       (opencode-client-agents
        connection
@@ -93,13 +100,15 @@ Includes non-hidden agents that are not in primary mode (i.e., subagents)."
                   (let* ((data (plist-get args :data))
                          (raw (opencode-session--normalize-agent-data data))
                          (agents (opencode-session--normalize-agents data)))
-                    (setf (opencode-connection-agents connection) agents)
+                    (setf (opencode-connection-agents connection)
+                          (or agents :unavailable))
                     (setf (opencode-connection-agents-raw connection) raw)
                     (when (buffer-live-p session-buffer)
                       (with-current-buffer session-buffer
                         (opencode-session--apply-default-agent connection)))))
        :error (lambda (&rest _args)
-                (error "OpenCode: failed to load agents"))))))
+                (setf (opencode-connection-agents connection) :unavailable)
+                (message "OpenCode: failed to load agents"))))))
 
 (defun opencode-session--apply-default-agent (connection)
   "Apply the default agent for the current session buffer."
@@ -128,10 +137,20 @@ Includes non-hidden agents that are not in primary mode (i.e., subagents)."
   (setf (opencode-connection-agents-raw connection) nil)
   (opencode-session--maybe-fetch-agents connection))
 
+(defun opencode-session--agents-changed (connection)
+  "Refresh cached agents for CONNECTION after a catalog change.
+Called on the server's `agent.updated' event.  Skips when a fetch is
+already in flight."
+  (when (and connection
+             (not (eq (opencode-connection-agents connection) :loading)))
+    (opencode-session--refresh-agents connection)))
+
 (defun opencode-session--available-agents ()
   "Return available agents for the current session buffer."
   (when opencode-session--connection
-    (opencode-connection-agents opencode-session--connection)))
+    (let ((agents (opencode-connection-agents opencode-session--connection)))
+      (when (listp agents)
+        agents))))
 
 (defun opencode-session--available-completable-agents ()
   "Return agent names available for @-mention completion.
@@ -157,15 +176,26 @@ These are non-hidden, non-primary agents (subagents)."
        (when (buffer-live-p buffer)
          (with-current-buffer buffer
            (opencode-session--ensure-agents connection)
-           (let ((agents (opencode-session--available-agents)))
-             (unless agents
-               (error "OpenCode agents not available"))
-             (let* ((agent (completing-read "OpenCode agent: " agents nil t
-                                            (or opencode-session--agent (car agents))))
-                    (index (cl-position agent agents :test #'string=)))
-               (if (and index agents)
-                   (opencode-session--set-agent agent index)
-                 (message "OpenCode: unknown agent %s" agent))))))))))
+           (opencode-session--select-when-loaded
+            buffer
+            #'opencode-session--available-agents
+            (lambda ()
+              (unless (eq (opencode-connection-agents connection) :loading)
+                (opencode-session--refresh-agents connection)))
+            #'opencode-session--prompt-agent-selection
+            "agents")))))))
+
+(defun opencode-session--prompt-agent-selection ()
+  "Prompt for an agent choice in the current session buffer."
+  (let ((agents (opencode-session--available-agents)))
+    (unless agents
+      (error "OpenCode agents not available"))
+    (let* ((agent (completing-read "OpenCode agent: " agents nil t
+                                   (or opencode-session--agent (car agents))))
+           (index (cl-position agent agents :test #'string=)))
+      (if (and index agents)
+          (opencode-session--set-agent agent index)
+        (message "OpenCode: unknown agent %s" agent)))))
 
 (defun opencode-session--cycle-agent (step)
   "Cycle the current agent by STEP positions."
@@ -210,7 +240,7 @@ These are non-hidden, non-primary agents (subagents)."
   (when connection
     (let ((providers (opencode-connection-providers connection)))
       (unless (or (and providers (or (vectorp providers) (listp providers)))
-                  (eq providers :loading))
+                  (memq providers '(:loading :unavailable)))
         (opencode-connection-ensure-providers
          connection
          (lambda (_items)
@@ -220,7 +250,7 @@ These are non-hidden, non-primary agents (subagents)."
   "Return provider catalog payload for CONNECTION."
   (when connection
     (let ((catalog (opencode-connection-provider-catalog connection)))
-      (unless (eq catalog :loading)
+      (unless (memq catalog '(:loading :unavailable))
         catalog))))
 
 (defun opencode-session--connected-provider-ids (connection)
@@ -396,6 +426,45 @@ Update recent models list, buffer state, and header."
   (opencode-session--render-header)
   (message "OpenCode model: %s/%s" provider-id model-id))
 
+(defun opencode-session--wait-for-load (ready-p on-ready &optional label)
+  "Poll READY-P until non-nil, then call ON-READY with no arguments.
+LABEL names the resource in the timeout message.  Gives up after about
+10 seconds so a stalled fetch cannot poll forever."
+  (let ((timer nil)
+        (attempts 0))
+    (setq timer
+          (run-at-time
+           0 0.5
+           (lambda ()
+             (cond
+              ((funcall ready-p)
+               (cancel-timer timer)
+               (funcall on-ready))
+              ((>= (cl-incf attempts) 20)
+               (cancel-timer timer)
+               (message "OpenCode: timed out waiting for %s"
+                        (or label "data")))))))))
+
+(defun opencode-session--select-when-loaded (buffer ready-p refresh prompt label)
+  "Run PROMPT in BUFFER once READY-P returns non-nil.
+REFRESH fetches data when nothing is in flight yet.  PROMPT runs
+immediately when READY-P already passes, otherwise after a bounded
+wait.  READY-P and PROMPT run in BUFFER.  LABEL names the resource
+in status messages."
+  (with-current-buffer buffer
+    (if (funcall ready-p)
+        (funcall prompt)
+      (funcall refresh)
+      (message "OpenCode: loading %s..." label)
+      (opencode-session--wait-for-load
+       (lambda ()
+         (and (buffer-live-p buffer)
+              (with-current-buffer buffer (funcall ready-p))))
+       (lambda ()
+         (when (buffer-live-p buffer)
+           (with-current-buffer buffer (funcall prompt))))
+       label))))
+
 (defun opencode-session-select-model ()
   "Select a provider and model for the current session buffer."
   (interactive)
@@ -405,31 +474,43 @@ Update recent models list, buffer state, and header."
        (when (buffer-live-p buffer)
          (with-current-buffer buffer
            (opencode-session--ensure-providers connection)
-           (let ((data (opencode-session--provider-model-completion-data)))
-             (unless (car data)
-               (error "OpenCode providers not available"))
-             (let* ((choices (car data))
-                    (lookup (cdr data))
-                    (completion-extra-properties
-                     '(:display-sort-function identity :cycle-sort-function identity))
-                    (selection (completing-read "OpenCode model: " choices nil t))
-                    (candidate (gethash selection lookup)))
-               (unless candidate
-                 (error "OpenCode: unknown model selection"))
-               (let ((provider-id (plist-get candidate :provider-id))
-                     (model-id (plist-get candidate :model-id))
-                     (connected-p (plist-get candidate :connected-p)))
-                 (if connected-p
-                     (opencode-session--apply-model-selection provider-id model-id)
-                    (opencode-session--connect-provider
-                     provider-id
-                     (lambda (&rest _ignored)
-                       (when (buffer-live-p buffer)
-                         (with-current-buffer buffer
-                           (opencode-session--apply-model-selection
-                            provider-id model-id)))))))))))))))
+           (opencode-session--select-when-loaded
+            buffer
+            (lambda ()
+              (car (opencode-session--provider-model-completion-data)))
+            (lambda ()
+              (unless (eq (opencode-connection-providers connection) :loading)
+                (opencode-session--refresh-providers connection)))
+            (lambda ()
+              (opencode-session--prompt-model-selection buffer))
+            "providers")))))))
 
-
+(defun opencode-session--prompt-model-selection (buffer)
+  "Prompt for a provider/model choice in BUFFER.
+BUFFER must be a live session buffer with loaded provider data."
+  (let ((data (opencode-session--provider-model-completion-data)))
+    (unless (car data)
+      (error "OpenCode providers not available"))
+    (let* ((choices (car data))
+           (lookup (cdr data))
+           (completion-extra-properties
+            '(:display-sort-function identity :cycle-sort-function identity))
+           (selection (completing-read "OpenCode model: " choices nil t))
+           (candidate (gethash selection lookup)))
+      (unless candidate
+        (error "OpenCode: unknown model selection"))
+      (let ((provider-id (plist-get candidate :provider-id))
+            (model-id (plist-get candidate :model-id))
+            (connected-p (plist-get candidate :connected-p)))
+        (if connected-p
+            (opencode-session--apply-model-selection provider-id model-id)
+          (opencode-session--connect-provider
+           provider-id
+           (lambda (&rest _ignored)
+             (when (buffer-live-p buffer)
+               (with-current-buffer buffer
+                 (opencode-session--apply-model-selection
+                  provider-id model-id))))))))))
 
 (defalias 'opencode-session-connect-provider #'opencode-session-select-model
   "Select a provider and model for the current session buffer.")
@@ -453,6 +534,12 @@ ON-SUCCESS is called when providers are loaded."
   "Return variant names from VARIANTS metadata."
   (let (keys)
     (cond
+     ((vectorp variants)
+      (dolist (entry (append variants nil))
+        (when (listp entry)
+          (let ((name (alist-get 'id entry)))
+            (when (stringp name)
+              (push name keys))))))
      ((hash-table-p variants)
       (maphash
        (lambda (key value)
@@ -473,6 +560,9 @@ ON-SUCCESS is called when providers are loaded."
                  (name (cond
                         ((stringp key) key)
                         ((symbolp key) (symbol-name key))
+                        ;; v2 decodes variants as a list of info objects.
+                        ((stringp (alist-get 'id entry))
+                         (alist-get 'id entry))
                         (t nil))))
             (unless (or (null name)
                         (and (listp value)
@@ -589,162 +679,191 @@ ON-SUCCESS is called when providers are loaded."
 
 ;;; Auth flows
 
-(defun opencode-session--post-auth-refresh (connection callback)
-  "Dispose instance state for CONNECTION, then refresh providers.
-
+(defun opencode-session--post-connect-refresh (connection callback)
+  "Refresh providers for CONNECTION, then call CALLBACK.
 CALLBACK is passed through to `opencode-session--refresh-providers'."
-  (let ((restart-sse
-         (lambda ()
-           (opencode-sse-close connection)
-           (opencode-sse-open connection))))
-    (opencode-client-instance-dispose
-     connection
-     :success (lambda (&rest _args)
-                (funcall restart-sse)
-                (opencode-session--refresh-providers connection callback))
-     :error (lambda (&rest _args)
-              (message "OpenCode: failed to dispose instance; refreshing providers")
-              (funcall restart-sse)
-              (opencode-session--refresh-providers connection callback)))))
+  (opencode-session--refresh-providers connection callback))
 
 (defun opencode-session--connect-provider (provider-id callback)
   "Run the auth flow for PROVIDER-ID, then call CALLBACK on success."
   (let ((connection opencode-session--connection))
     (unless connection
       (error "OpenCode session is not connected"))
-    (message "OpenCode: fetching auth methods for %s..." provider-id)
-    (opencode-client-provider-auth-methods
+    (message "OpenCode: fetching integrations for %s..." provider-id)
+    (opencode-client-integrations
      connection
      :success (lambda (&rest args)
                 (let* ((data (plist-get args :data))
-                       (methods (opencode-session--provider-auth-methods
+                       (methods (opencode-session--integration-methods
                                  provider-id data)))
                   (opencode-session--run-auth-flow
                    connection provider-id methods callback)))
      :error (lambda (&rest _args)
-              (message "OpenCode: failed to fetch auth methods, trying API key")
-              (opencode-session--run-auth-flow
-               connection provider-id
-               '(((type . "api") (label . "API key")))
-               callback)))))
+              (error "OpenCode: failed to fetch integrations")))))
 
-(defun opencode-session--provider-auth-methods (provider-id data)
-  "Return auth methods for PROVIDER-ID from DATA.
-
+(defun opencode-session--integration-methods (provider-id data)
+  "Return auth methods for PROVIDER-ID from integration DATA.
+DATA is the `{location, data: [...]}` envelope of `integration.list'.
 Falls back to a single API key method when none are found."
-  (let* ((methods (or (alist-get (intern provider-id) data)
-                      (alist-get provider-id data nil nil #'string=))))
-    (if (and methods (or (listp methods) (vectorp methods)))
-        (opencode-session--normalize-items methods)
-      '(((type . "api") (label . "API key"))))))
+  (let* ((items (opencode-session--normalize-items (alist-get 'data data)))
+         (info (cl-find provider-id items
+                        :key (lambda (item) (alist-get 'id item))
+                        :test #'string=))
+         (methods (and info (opencode-session--normalize-items
+                             (alist-get 'methods info)))))
+    (or methods '(((type . "key") (label . "API key"))))))
+
+(defun opencode-session--auth-method-display (method)
+  "Return selection text for auth METHOD."
+  (let ((type (alist-get 'type method))
+        (label (alist-get 'label method)))
+    (if (and (stringp label) (not (string-empty-p label)))
+        (format "%s (%s)" label type)
+      (or type "unknown"))))
 
 (defun opencode-session--run-auth-flow (connection provider-id methods callback)
   "Run auth for PROVIDER-ID on CONNECTION using METHODS, then CALLBACK."
   (let* ((method (if (= (length methods) 1)
                      (car methods)
                    (opencode-session--choose-auth-method methods)))
-         (method-type (alist-get 'type method))
-         (method-index (cl-position method methods :test #'equal)))
+         (method-type (alist-get 'type method)))
     (cond
-     ((string= method-type "api")
-      (opencode-session--auth-api-key connection provider-id callback))
+     ((string= method-type "key")
+      (opencode-session--auth-api-key connection provider-id method callback))
      ((string= method-type "oauth")
-      (opencode-session--auth-oauth
-       connection provider-id method-index callback))
+      (opencode-session--auth-oauth connection provider-id method callback))
+     ((string= method-type "env")
+      (message "OpenCode: %s authenticates via environment variables" provider-id))
      (t (error "OpenCode: unsupported auth method type %s" method-type)))))
 
 (defun opencode-session--choose-auth-method (methods)
   "Prompt the user to choose from METHODS."
-  (let* ((labels (mapcar (lambda (m) (alist-get 'label m)) methods))
+  (let* ((displays (mapcar #'opencode-session--auth-method-display methods))
          (completion-extra-properties
           '(:display-sort-function identity :cycle-sort-function identity))
-         (selection (completing-read "OpenCode auth method: " labels nil t))
-         (index (cl-position selection labels :test #'string=)))
+         (selection (completing-read "OpenCode auth method: " displays nil t))
+         (index (cl-position selection displays :test #'string=)))
     (nth index methods)))
 
-(defun opencode-session--auth-api-key (connection provider-id callback)
-  "Prompt for an API key for PROVIDER-ID on CONNECTION, then CALLBACK."
-  (let ((key (read-string (format "API key for %s: " provider-id))))
+(defun opencode-session--read-method-answer (method)
+  "Prompt for METHOD's extra form fields.
+Returns an answer alist, or nil when the method needs no answers."
+  (let ((fields (opencode-session--normalize-items (alist-get 'form method))))
+    (when fields
+      (delq nil (mapcar #'opencode-session--form-read-field fields)))))
+
+(defun opencode-session--auth-api-key (connection provider-id method callback)
+  "Prompt for an API key for PROVIDER-ID on CONNECTION, then CALLBACK.
+METHOD supplies the prompt label and any extra form fields."
+  (let* ((label (or (alist-get 'label method) "API key"))
+         (key (read-string (format "%s for %s: " label provider-id))))
     (when (string-empty-p key)
       (error "OpenCode: API key cannot be empty"))
-    (message "OpenCode: setting API key for %s..." provider-id)
-    (opencode-client-auth-set
+    (message "OpenCode: connecting %s..." provider-id)
+    (opencode-client-integration-connect-key
      connection
      provider-id
-     `((type . "api") (key . ,key))
+     key
+     :answer (opencode-session--read-method-answer method)
      :success (lambda (&rest _args)
                 (message "OpenCode: %s connected" provider-id)
-                (opencode-session--post-auth-refresh connection callback))
+                (opencode-session--post-connect-refresh connection callback))
      :error (lambda (&rest _args)
-              (message "OpenCode: failed to set API key for %s" provider-id)))))
+              (message "OpenCode: failed to connect %s" provider-id)))))
 
-(defun opencode-session--auth-oauth (connection provider-id method-index callback)
-  "Run OAuth flow for PROVIDER-ID on CONNECTION using METHOD-INDEX.
-
+(defun opencode-session--auth-oauth (connection provider-id method callback)
+  "Run the OAuth flow for METHOD on CONNECTION.
 CALLBACK is called on successful authorization."
-  (message "OpenCode: starting OAuth for %s..." provider-id)
-  (opencode-client-provider-oauth-authorize
-   connection
-   provider-id
-   method-index
-   :success (lambda (&rest args)
-              (let* ((data (plist-get args :data))
-                     (url (alist-get 'url data))
-                     (method (alist-get 'method data))
-                     (instructions (alist-get 'instructions data)))
-                (when instructions
-                  (message "OpenCode: %s" instructions))
-                (when url
-                  (let ((browse-url-browser-function #'browse-url-default-browser))
-                    (browse-url url)))
-                (cond
-                 ((string= method "code")
-                  (opencode-session--auth-oauth-code
-                   connection provider-id method-index callback))
-                 ((string= method "auto")
-                  (opencode-session--auth-oauth-auto
-                   connection provider-id method-index callback))
-                 (t (error "OpenCode: unknown OAuth method %s" method)))))
-   :error (lambda (&rest _args)
-            (message "OpenCode: OAuth authorization failed for %s"
-                     provider-id))))
+  (let ((method-id (alist-get 'id method)))
+    (unless method-id
+      (error "OpenCode: OAuth method is missing ID"))
+    (message "OpenCode: starting OAuth for %s..." provider-id)
+    (opencode-client-integration-oauth-begin
+     connection
+     provider-id
+     method-id
+     :answer (opencode-session--read-method-answer method)
+     :success (lambda (&rest args)
+                (let ((attempt (alist-get 'data (plist-get args :data))))
+                  (opencode-session--auth-oauth-attempt
+                   connection provider-id attempt callback)))
+     :error (lambda (&rest _args)
+              (message "OpenCode: OAuth authorization failed for %s"
+                       provider-id)))))
 
-(defun opencode-session--auth-oauth-code (connection provider-id method-index callback)
-  "Complete OAuth code flow for PROVIDER-ID on CONNECTION.
+(defun opencode-session--auth-oauth-attempt (connection provider-id attempt callback)
+  "Continue OAuth from ATTEMPT details, then CALLBACK.
+Opens the authorization URL and dispatches on the attempt mode."
+  (let ((attempt-id (alist-get 'attemptID attempt))
+        (url (alist-get 'url attempt))
+        (mode (alist-get 'mode attempt))
+        (instructions (alist-get 'instructions attempt)))
+    (unless attempt-id
+      (error "OpenCode: OAuth attempt is missing ID"))
+    (when (and (stringp instructions) (not (string-empty-p instructions)))
+      (message "OpenCode: %s" instructions))
+    (when url
+      (let ((browse-url-browser-function #'browse-url-default-browser))
+        (browse-url url)))
+    (cond
+     ((string= mode "code")
+      (opencode-session--auth-oauth-code
+       connection provider-id attempt-id callback))
+     ((string= mode "auto")
+      (opencode-session--auth-oauth-poll
+       connection provider-id attempt-id callback 0))
+     (t (error "OpenCode: unknown OAuth mode %s" mode)))))
 
-METHOD-INDEX identifies the auth method.  CALLBACK is called on success."
+(defun opencode-session--auth-oauth-code (connection provider-id attempt-id callback)
+  "Complete a code-mode OAuth attempt ATTEMPT-ID, then CALLBACK."
   (let ((code (read-string
                (format "Authorization code for %s: " provider-id))))
     (when (string-empty-p code)
       (error "OpenCode: authorization code cannot be empty"))
     (message "OpenCode: completing OAuth for %s..." provider-id)
-    (opencode-client-provider-oauth-callback
+    (opencode-client-integration-oauth-complete
      connection
      provider-id
-     method-index
+     attempt-id
      :code code
      :success (lambda (&rest _args)
                 (message "OpenCode: %s connected" provider-id)
-                (opencode-session--post-auth-refresh connection callback))
+                (opencode-session--post-connect-refresh connection callback))
      :error (lambda (&rest _args)
               (message "OpenCode: OAuth callback failed for %s"
                        provider-id)))))
 
-(defun opencode-session--auth-oauth-auto (connection provider-id method-index callback)
-  "Complete OAuth auto flow for PROVIDER-ID on CONNECTION.
-
-METHOD-INDEX identifies the auth method.  CALLBACK is called on success.
-This is a long-polling call that waits for browser authorization."
-  (message "OpenCode: waiting for browser authorization for %s..." provider-id)
-  (opencode-client-provider-oauth-callback
+(defun opencode-session--auth-oauth-poll (connection provider-id attempt-id callback count)
+  "Poll an auto-mode OAuth attempt ATTEMPT-ID, then CALLBACK.
+COUNT tracks polls; polling stops after about two minutes."
+  (opencode-client-integration-oauth-status
    connection
    provider-id
-   method-index
-   :success (lambda (&rest _args)
-              (message "OpenCode: %s connected" provider-id)
-              (opencode-session--post-auth-refresh connection callback))
+   attempt-id
+   :success (lambda (&rest args)
+              (let* ((status (alist-get 'data (plist-get args :data)))
+                     (state (alist-get 'status status)))
+                (cond
+                 ((string= state "complete")
+                  (message "OpenCode: %s connected" provider-id)
+                  (opencode-session--post-connect-refresh connection callback))
+                 ((string= state "failed")
+                  (message "OpenCode: OAuth failed for %s%s"
+                           provider-id
+                           (let ((detail (alist-get 'message status)))
+                             (if (stringp detail)
+                                 (format " (%s)" detail)
+                               ""))))
+                 ((string= state "expired")
+                  (message "OpenCode: OAuth attempt expired for %s" provider-id))
+                 ((>= count 60)
+                  (message "OpenCode: timed out waiting for OAuth for %s"
+                           provider-id))
+                 (t (run-at-time 2 nil #'opencode-session--auth-oauth-poll
+                                 connection provider-id attempt-id callback
+                                 (1+ count))))))
    :error (lambda (&rest _args)
-            (message "OpenCode: OAuth callback failed for %s"
+            (message "OpenCode: OAuth status check failed for %s"
                      provider-id))))
 
 (provide 'emacs-opencode-session-model)
