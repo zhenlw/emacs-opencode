@@ -15,6 +15,14 @@
 
 (declare-function opencode-run-server "emacs-opencode" (directory &optional on-ready))
 (declare-function opencode-session--maybe-register-subagent "emacs-opencode-session-handlers")
+(declare-function opencode-session--current-agent "emacs-opencode-session-model")
+(declare-function opencode-session--set-server-model "emacs-opencode-session-model"
+                  (ref))
+(declare-function opencode-session--set-server-agent "emacs-opencode-session-model"
+                  (agent))
+(declare-function opencode-session--sync-agent-index "emacs-opencode-session-model")
+(declare-function opencode-session--adopt-selection-from-messages
+                  "emacs-opencode-session-model")
 
 (defcustom opencode-session-input-prompt "❯ "
   "Prompt string shown before the session input area."
@@ -89,10 +97,8 @@ Each function receives SESSION and INPUT as arguments.")
   (setq-local font-lock-extra-managed-props '(opencode-bold-italic opencode-bold))
   (setq-local buffer-read-only nil)
   (setq-local opencode-session--messages nil)
-  (setq-local opencode-session--agent nil)
-  (setq-local opencode-session--provider-id nil)
-  (setq-local opencode-session--model-id nil)
-  (setq-local opencode-session--variant nil)
+  (setq-local opencode-session--server-model nil)
+  (setq-local opencode-session--server-agent nil)
   (setq-local opencode-session--show-reasoning opencode-session-show-reasoning)
   (opencode-session--ensure-markers)
   (add-hook 'completion-at-point-functions
@@ -336,7 +342,7 @@ message, fork the whole session."
        (when (buffer-live-p buffer)
          (with-current-buffer buffer
            (let ((session-id (opencode-session-id opencode-session--session))
-                 (agent opencode-session--agent))
+                 (agent (opencode-session--current-agent)))
              (opencode-client-commands
               connection
               :success (lambda (&rest args)
@@ -476,16 +482,6 @@ message, fork the whole session."
 
 ;;; Sending messages
 
-(defun opencode-session--selected-model ()
-  "Return the selected model as a cons (PROVIDER-ID . MODEL-ID) or nil."
-  (when (and opencode-session--provider-id opencode-session--model-id)
-    (cons opencode-session--provider-id opencode-session--model-id)))
-
-(defun opencode-session--selected-model-string ()
-  "Return the selected model as a \"provider/model\" string or nil."
-  (when (and opencode-session--provider-id opencode-session--model-id)
-    (format "%s/%s" opencode-session--provider-id opencode-session--model-id)))
-
 (defun opencode-session--extract-agent-mentions (input)
   "Extract @-agent mentions from INPUT.
 Returns a list of agent name strings found in INPUT that match
@@ -577,7 +573,7 @@ Falls back to a normal prompt when INPUT does not match an available command."
                              (opencode-session-id session)
                              command
                              arguments
-                             :agent opencode-session--agent
+                             :agent (opencode-session--current-agent)
                              :success (lambda (&rest _args)
                                         (message "OpenCode command queued"))
                              :error (lambda (&rest _args)
@@ -727,19 +723,22 @@ PREVIOUS-NAME is the previous buffer name to compare against."
       (setq opencode-session--messages
             (append opencode-session--messages (list message))))
     (when message
-      (opencode-session--adopt-model-from-message message)
+      (opencode-session--adopt-selection-from-message message)
       (opencode-session--render-header))))
 
-(defun opencode-session--adopt-model-from-message (message)
-  "Adopt provider/model from MESSAGE for header display."
-  (when (and (opencode-message-p message)
-             (stringp (opencode-message-provider-id message))
-             (stringp (opencode-message-model-id message))
-             (not (string-empty-p (opencode-message-provider-id message)))
-             (not (string-empty-p (opencode-message-model-id message))))
-    (setq-local opencode-session--provider-id (opencode-message-provider-id message))
-    (setq-local opencode-session--model-id (opencode-message-model-id message))
-    (opencode-session--sync-variant-selection)))
+(defun opencode-session--adopt-selection-from-message (message)
+  "Refresh the server selection state after MESSAGE arrived.
+A `model-switched' or `agent-switched' message is the server's own
+record of a selection, so it updates the cached selection when the
+corresponding SSE event has not been seen yet."
+  (let ((info (and (opencode-message-p message)
+                   (opencode-message-info message))))
+    (when (consp info)
+      (cond
+       ((equal (alist-get 'type info) "model-switched")
+        (opencode-session--set-server-model (alist-get 'model info)))
+       ((equal (alist-get 'type info) "agent-switched")
+        (opencode-session--set-server-agent (alist-get 'agent info)))))))
 
 (defun opencode-session--update-message (message info)
   "Update MESSAGE fields from INFO."
@@ -749,10 +748,14 @@ PREVIOUS-NAME is the previous buffer name to compare against."
          (completed (alist-get 'completed time))
          (provider-id (or (alist-get 'providerID info)
                           (alist-get 'providerID model)))
+         ;; v2 names the model reference field `id'; v1 used `modelID'.
          (model-id (or (alist-get 'modelID info)
-                       (alist-get 'modelID model))))
+                       (alist-get 'modelID model)
+                       (alist-get 'id model))))
     (setf (opencode-message-session-id message) (alist-get 'sessionID info))
-    (setf (opencode-message-role message) (alist-get 'role info))
+    ;; v2 sends the message kind as `type'; v1 used `role'.
+    (setf (opencode-message-role message)
+          (or (alist-get 'type info) (alist-get 'role info)))
     (setf (opencode-message-parent-id message) (alist-get 'parentID info))
     (setf (opencode-message-model-id message) model-id)
     (setf (opencode-message-provider-id message) provider-id)
@@ -1090,7 +1093,8 @@ preceded by whitespace or the start of the input region."
                   (setf (opencode-connection-agents-raw connection) raw)
                   (when (buffer-live-p session-buffer)
                     (with-current-buffer session-buffer
-                      (opencode-session--apply-default-agent connection)
+                      (opencode-session--sync-agent-index)
+                      (opencode-session--render-header)
                       (completion-at-point)))))
      :error (lambda (&rest _args)
               (message "OpenCode: failed to load agents")))))
@@ -1152,7 +1156,9 @@ Call ON-HISTORY-LOADED with BUFFER after the request completes."
                     (dolist (item items)
                       (opencode-session--hydrate-message
                        item (opencode-session-id session)))
-                    (opencode-session--render-buffer))
+                    (opencode-session--adopt-selection-from-messages)
+                    (opencode-session--render-buffer)
+                    (opencode-session--render-header))
                   (when on-history-loaded
                     (funcall on-history-loaded buffer)))))
    :error (lambda (&rest _args)

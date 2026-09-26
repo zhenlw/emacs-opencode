@@ -211,8 +211,6 @@
   (with-temp-buffer
     (opencode-session-mode)
     (setq-local opencode-session--session (opencode-session-create :id "s1"))
-    (setq-local opencode-session--provider-id "anthropic")
-    (setq-local opencode-session--model-id "claude")
     (let (sent-connection sent-session)
       (cl-letf (((symbol-function 'opencode-session--ensure-connection)
                  (lambda (callback) (funcall callback 'conn)))

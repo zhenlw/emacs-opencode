@@ -21,10 +21,13 @@
 (declare-function opencode-session--ensure-stream-message "emacs-opencode-session-mode")
 (declare-function opencode-session--upsert-stream-part "emacs-opencode-session-mode")
 (declare-function opencode-session--stream-text-part-id "emacs-opencode-session-mode")
-(declare-function opencode-session--adopt-model-from-message "emacs-opencode-session-mode")
 (declare-function opencode-session--register-subagent "emacs-opencode-session-mode")
 (declare-function opencode-session--buffer-name "emacs-opencode-session-mode")
 (declare-function opencode-session--rename-buffer "emacs-opencode-session-mode")
+(declare-function opencode-session--set-server-model "emacs-opencode-session-model"
+                  (ref))
+(declare-function opencode-session--set-server-agent "emacs-opencode-session-model"
+                  (agent))
 (declare-function opencode-session--agents-changed "emacs-opencode-session-model"
                   (connection))
 
@@ -271,6 +274,34 @@ not block the process filter."
         (with-current-buffer buffer
           (opencode-session--update-session info))))))
 
+(defun opencode-session--handle-model-selected (_event data)
+  "Handle the session.model.selected SSE DATA.
+
+The payload carries the session's new `model' reference, so this is
+the authoritative refresh point for the model shown in the header."
+  (let* ((properties (alist-get 'properties data))
+         (session-id (alist-get 'sessionID properties))
+         (model (alist-get 'model properties)))
+    (when-let* ((buffer (opencode-session--buffer-for-session session-id)))
+      (when (buffer-live-p buffer)
+        (with-current-buffer buffer
+          (opencode-session--set-server-model model)
+          (opencode-session--render-header))))))
+
+(defun opencode-session--handle-agent-selected (_event data)
+  "Handle the session.agent.selected SSE DATA.
+
+The payload carries the session's new agent name, so this is the
+authoritative refresh point for the agent shown in the header."
+  (let* ((properties (alist-get 'properties data))
+         (session-id (alist-get 'sessionID properties))
+         (agent (alist-get 'agent properties)))
+    (when-let* ((buffer (opencode-session--buffer-for-session session-id)))
+      (when (buffer-live-p buffer)
+        (with-current-buffer buffer
+          (opencode-session--set-server-agent agent)
+          (opencode-session--render-header))))))
+
 (defun opencode-session--status-from-info (status-info)
   "Build an `opencode-status' struct from STATUS-INFO alist.
 
@@ -411,7 +442,6 @@ tracking and re-render the parent task tool part."
                   (or (alist-get 'modelID model) (alist-get 'id model)))
             (setf (opencode-message-provider-id message)
                   (alist-get 'providerID model))
-            (opencode-session--adopt-model-from-message message)
             (opencode-session--render-header)))))))
 
 (defun opencode-session--handle-step-ended (_event data)
@@ -1005,6 +1035,12 @@ Returns nil when PATH is not a string."
 
 (opencode-sse-define-handler session-updated "session.updated" (_event data _meta)
   (opencode-session--handle-session-updated _event data))
+
+(opencode-sse-define-handler model-selected "session.model.selected" (_event data _meta)
+  (opencode-session--handle-model-selected _event data))
+
+(opencode-sse-define-handler agent-selected "session.agent.selected" (_event data _meta)
+  (opencode-session--handle-agent-selected _event data))
 
 (opencode-sse-define-handler session-renamed "session.renamed" (_event data _meta)
   (opencode-session--handle-session-renamed _event data))

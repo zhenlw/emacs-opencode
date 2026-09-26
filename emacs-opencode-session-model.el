@@ -4,11 +4,11 @@
 (require 'subr-x)
 (require 'emacs-opencode-session-vars)
 (require 'emacs-opencode-connection)
+(require 'emacs-opencode-message)
 (require 'emacs-opencode-client)
 (require 'emacs-opencode-sse)
 
 (declare-function opencode-session--render-header "emacs-opencode-session-header")
-(declare-function opencode-session--active-model "emacs-opencode-session-header")
 (declare-function opencode-session--session-used-models "emacs-opencode-session-header")
 (declare-function opencode-session--maybe-start-spinner "emacs-opencode-session-header")
 (declare-function opencode-session--maybe-stop-spinner "emacs-opencode-session-header")
@@ -16,7 +16,11 @@
 (declare-function opencode-session--form-read-field "emacs-opencode-session-handlers" (field))
 
 (defcustom opencode-session-default-agent "plan"
-  "Default agent name for new OpenCode sessions."
+  "Agent name shown until the server reports an agent for the session.
+
+This is a display fallback only.  The server owns the session agent, so
+the value is never sent: pick an agent with `opencode-session-select-agent'
+to switch the session for real."
   :type 'string
   :group 'emacs-opencode)
 
@@ -33,10 +37,189 @@ When nil, do not auto-select a model variant."
 Most recently selected first.")
 
 (defvar-local opencode-session--agent-index nil
-  "Index of the selected agent in the available agents list.")
+  "Index of the server-selected agent in the available agents list.")
 
 (defvar-local opencode-session--variant-index nil
-  "Index of the selected variant in the available variants list.")
+  "Index of the server-selected variant in the available variants list.")
+
+;;; Server-authoritative selection
+;;
+;; The OpenCode server owns the session agent and model.  It applies a
+;; selection with `POST /api/session/:id/agent' and
+;; `POST /api/session/:id/model', records it in the message history as an
+;; `agent-switched' or `model-switched' message, and broadcasts a
+;; `session.agent.selected' or `session.model.selected' event.  The client
+;; keeps no authoritative copy of its own: it seeds the selection from the
+;; message history when a session loads and refreshes it from those events.
+;; `Session.Info' is deliberately unused -- its `agent' and `model' fields
+;; come back nil even for sessions that have run turns.
+
+(defun opencode-session--model-ref-p (ref)
+  "Return non-nil when REF looks like a server `Model.Ref' alist."
+  (and (consp ref)
+       (stringp (alist-get 'id ref))
+       (stringp (alist-get 'providerID ref))))
+
+(defun opencode-session--newest-message-info (type)
+  "Return the info of the most recent message whose `type' is TYPE.
+
+Compares `time.created' rather than list position: `opencode-session--messages'
+mixes newest-first API history with messages appended while streaming."
+  (let (best best-time found)
+    (dolist (message opencode-session--messages)
+      (let ((info (opencode-message-info message)))
+        (when (and (consp info) (equal (alist-get 'type info) type))
+          (let* ((created (alist-get 'created (alist-get 'time info)))
+                 (newer (or (not found)
+                            (and (numberp created) (null best-time))
+                            (and (numberp created)
+                                 (numberp best-time)
+                                 (> created best-time)))))
+            (when newer
+              (setq best info
+                    best-time (and (numberp created) created)
+                    found t))))))
+    best))
+
+(defun opencode-session--message-model-ref (type)
+  "Return the model reference carried by the newest message of TYPE."
+  (let ((model (alist-get 'model (opencode-session--newest-message-info type))))
+    (and (opencode-session--model-ref-p model) model)))
+
+(defun opencode-session--message-agent (type)
+  "Return the agent carried by the newest message of TYPE."
+  (let ((agent (alist-get 'agent (opencode-session--newest-message-info type))))
+    (and (stringp agent) agent)))
+
+(defun opencode-session--set-server-model (ref)
+  "Record REF as the server-reported model selection for this buffer."
+  (when (opencode-session--model-ref-p ref)
+    (setq-local opencode-session--server-model ref)
+    (opencode-session--sync-variant-selection)))
+
+(defun opencode-session--set-server-agent (agent)
+  "Record AGENT as the server-reported agent for this buffer."
+  (when (stringp agent)
+    (setq-local opencode-session--server-agent agent)
+    (opencode-session--sync-agent-index)))
+
+(defun opencode-session--adopt-selection-from-messages ()
+  "Seed the server selection state from the loaded message history."
+  (let ((model (opencode-session--message-model-ref "model-switched"))
+        (agent (opencode-session--message-agent "agent-switched")))
+    (when (opencode-session--model-ref-p model)
+      (setq-local opencode-session--server-model model))
+    (when (stringp agent)
+      (setq-local opencode-session--server-agent agent))
+    (opencode-session--sync-agent-index)
+    (opencode-session--sync-variant-selection)))
+
+(defun opencode-session--current-model-ref ()
+  "Return the server's model reference for this buffer.
+
+Falls back to the model of the newest assistant message when the server
+has recorded no explicit selection."
+  (or opencode-session--server-model
+      (opencode-session--message-model-ref "assistant")))
+
+(defun opencode-session--current-model ()
+  "Return the active model as a cons (PROVIDER-ID . MODEL-ID)."
+  (let ((ref (opencode-session--current-model-ref)))
+    (when (opencode-session--model-ref-p ref)
+      (cons (alist-get 'providerID ref) (alist-get 'id ref)))))
+
+(defun opencode-session--variant-of (ref)
+  "Return the non-empty variant of the model reference REF, or nil."
+  (let ((variant (and (consp ref) (alist-get 'variant ref))))
+    (and (stringp variant) (not (string-empty-p variant)) variant)))
+
+(defun opencode-session--current-variant ()
+  "Return the variant of the active model, or nil when it has none.
+
+A selection made without an explicit variant still resolves to one, so
+fall back to the variant the server recorded on the newest assistant
+message for the same model."
+  (let* ((ref (opencode-session--current-model-ref))
+         (used (opencode-session--message-model-ref "assistant")))
+    (or (opencode-session--variant-of ref)
+        (and (equal (alist-get 'id used) (alist-get 'id ref))
+             (equal (alist-get 'providerID used) (alist-get 'providerID ref))
+             (opencode-session--variant-of used)))))
+
+(defun opencode-session--current-agent ()
+  "Return the server-selected agent name for this buffer.
+
+Falls back to the agent of the newest assistant message and then to
+`opencode-session-default-agent', so the header always names an agent."
+  (or opencode-session--server-agent
+      (opencode-session--message-agent "assistant")
+      opencode-session-default-agent))
+
+(defun opencode-session--sync-agent-index ()
+  "Align the agent menu cursor with the server-selected agent."
+  (let* ((agents (opencode-session--available-agents))
+         (agent opencode-session--server-agent)
+         (index (and agent agents
+                     (cl-position agent agents :test #'string=))))
+    (setq-local opencode-session--agent-index index)))
+
+(defun opencode-session--failure-detail (args)
+  "Return a parenthesized detail suffix for the failed request ARGS."
+  (let ((detail (opencode-client-format-error args)))
+    (if detail (format " (%s)" detail) "")))
+
+(defun opencode-session--require-session-id ()
+  "Return the session ID of the current buffer, or signal an error."
+  (or (and opencode-session--session
+           (opencode-session-id opencode-session--session))
+      (error "OpenCode session is not connected")))
+
+(defun opencode-session--post-model (model-id provider-id variant)
+  "Ask the server to switch this session to MODEL-ID from PROVIDER-ID.
+
+VARIANT is omitted when nil.  The accepted selection is recorded locally
+so the header updates immediately; the server's `session.model.selected'
+event confirms it."
+  (let* ((ref (opencode-client--model-ref model-id provider-id variant))
+         (connection opencode-session--connection)
+         (buffer (current-buffer))
+         (session-id (opencode-session--require-session-id)))
+    (unless connection
+      (error "OpenCode session is not connected"))
+    (opencode-client-session-set-model
+     connection session-id ref
+     :success (lambda (&rest _args)
+                (when (buffer-live-p buffer)
+                  (with-current-buffer buffer
+                    (opencode-session--set-server-model ref)
+                    (opencode-session--render-header))))
+     :error (lambda (&rest args)
+              (message "OpenCode: failed to set model%s"
+                       (opencode-session--failure-detail args))))))
+
+(defun opencode-session--post-agent (agent)
+  "Ask the server to switch this session to AGENT.
+
+The agent menu cursor is moved immediately and corrected by the
+server's `session.agent.selected' event."
+  (let ((connection opencode-session--connection)
+        (buffer (current-buffer))
+        (session-id (opencode-session--require-session-id)))
+    (unless connection
+      (error "OpenCode session is not connected"))
+    (opencode-client-session-set-agent
+     connection session-id agent
+     :success (lambda (&rest _args)
+                (when (buffer-live-p buffer)
+                  (with-current-buffer buffer
+                    (opencode-session--set-server-agent agent)
+                    (opencode-session--render-header))))
+     :error (lambda (&rest args)
+              (when (buffer-live-p buffer)
+                (with-current-buffer buffer
+                  (opencode-session--sync-agent-index)))
+              (message "OpenCode: failed to set agent%s"
+                       (opencode-session--failure-detail args))))))
 
 ;;; Agent management
 
@@ -105,30 +288,18 @@ Includes non-hidden agents that are not in primary mode (i.e., subagents)."
                     (setf (opencode-connection-agents-raw connection) raw)
                     (when (buffer-live-p session-buffer)
                       (with-current-buffer session-buffer
-                        (opencode-session--apply-default-agent connection)))))
+                        (opencode-session--sync-agent-index)))
+                    (opencode-session--refresh-headers connection)))
        :error (lambda (&rest _args)
                 (setf (opencode-connection-agents connection) :unavailable)
                 (message "OpenCode: failed to load agents"))))))
 
-(defun opencode-session--apply-default-agent (connection)
-  "Apply the default agent for the current session buffer."
-  (when (and (eq connection opencode-session--connection)
-             (not opencode-session--agent))
-    (let ((agents (opencode-connection-agents connection)))
-      (when (and agents (listp agents))
-        (let* ((preferred opencode-session-default-agent)
-               (index (and preferred
-                           (cl-position preferred agents :test #'string=)))
-               (agent (if index (nth index agents) (car agents)))
-               (final-index (or index 0)))
-          (setq-local opencode-session--agent agent)
-          (setq-local opencode-session--agent-index final-index)
-          (opencode-session--render-header))))))
-
 (defun opencode-session--ensure-agents (connection)
   "Ensure agent list is available for CONNECTION."
   (if (opencode-connection-agents connection)
-      (opencode-session--apply-default-agent connection)
+      (when (eq connection opencode-session--connection)
+        (opencode-session--sync-agent-index)
+        (opencode-session--render-header))
     (opencode-session--maybe-fetch-agents connection)))
 
 (defun opencode-session--refresh-agents (connection)
@@ -161,9 +332,12 @@ These are non-hidden, non-primary agents (subagents)."
         (opencode-session--completable-agent-names raw)))))
 
 (defun opencode-session--set-agent (agent index)
-  "Set the current session agent to AGENT at INDEX."
-  (setq-local opencode-session--agent agent)
+  "Ask the server to switch the current session to AGENT.
+
+INDEX is the position of AGENT in the available agents list.  It is
+kept as the menu cursor until the server confirms the selection."
   (setq-local opencode-session--agent-index index)
+  (opencode-session--post-agent agent)
   (opencode-session--render-header)
   (message "OpenCode agent: %s" agent))
 
@@ -191,7 +365,8 @@ These are non-hidden, non-primary agents (subagents)."
     (unless agents
       (error "OpenCode agents not available"))
     (let* ((agent (completing-read "OpenCode agent: " agents nil t
-                                   (or opencode-session--agent (car agents))))
+                                   (or (opencode-session--current-agent)
+                                       (car agents))))
            (index (cl-position agent agents :test #'string=)))
       (if (and index agents)
           (opencode-session--set-agent agent index)
@@ -409,20 +584,34 @@ The return value is a cons of (CHOICES . LOOKUP)."
       (when (buffer-live-p buffer)
         (with-current-buffer buffer
           (when (eq opencode-session--connection connection)
+            (opencode-session--sync-agent-index)
             (opencode-session--sync-variant-selection)
             (opencode-session--render-header)))))
    opencode-session--buffers))
 
+(defun opencode-session--variant-for-model (provider-id model-id)
+  "Return the active variant when MODEL-ID from PROVIDER-ID supports it.
+Returns nil when no variant is active or the model has no such variant."
+  (let ((variant (opencode-session--current-variant)))
+    (when (and variant
+               (cl-member variant (opencode-session--model-variants
+                                   provider-id model-id)
+                          :test #'string=))
+      variant)))
+
 (defun opencode-session--apply-model-selection (provider-id model-id)
-  "Apply PROVIDER-ID and MODEL-ID as the active model.
-Update recent models list, buffer state, and header."
+  "Select MODEL-ID from PROVIDER-ID as the session model.
+
+Records the choice in the recent models list and asks the server to
+apply it; the server records the selection and confirms it with a
+`session.model.selected' event."
   (let ((key (cons provider-id model-id)))
     (setq opencode-session--recent-models
           (cons key (cl-remove key opencode-session--recent-models
                                :test #'equal))))
-  (setq-local opencode-session--provider-id provider-id)
-  (setq-local opencode-session--model-id model-id)
-  (opencode-session--sync-variant-selection)
+  (opencode-session--post-model
+   model-id provider-id
+   (opencode-session--variant-for-model provider-id model-id))
   (opencode-session--render-header)
   (message "OpenCode model: %s/%s" provider-id model-id))
 
@@ -570,41 +759,39 @@ ON-SUCCESS is called when providers are loaded."
               (push name keys)))))))
     (sort (delete-dups keys) #'string-lessp)))
 
-(defun opencode-session--available-variants ()
-  "Return available variant names for the active model."
-  (when-let* ((model (opencode-session--active-model))
-              (model-info (opencode-session--provider-model-info
-                           (car model)
-                           (cdr model)
-                           opencode-session--connection)))
+(defun opencode-session--model-variants (provider-id model-id)
+  "Return variant names available for MODEL-ID from PROVIDER-ID."
+  (when-let* ((model-info (opencode-session--provider-model-info
+                            provider-id model-id
+                            opencode-session--connection)))
     (opencode-session--variant-keys (alist-get 'variants model-info))))
 
+(defun opencode-session--available-variants ()
+  "Return available variant names for the active model."
+  (when-let* ((model (opencode-session--current-model)))
+    (opencode-session--model-variants (car model) (cdr model))))
+
 (defun opencode-session--sync-variant-selection ()
-  "Sync selected variant with available variants for the active model."
+  "Align the variant menu cursor with the server-selected variant."
   (let* ((variants (opencode-session--available-variants))
-         (current opencode-session--variant)
-         (current-index (and current
-                             variants
-                             (cl-position current variants :test #'string=))))
-    (cond
-     (current-index
-      (setq-local opencode-session--variant-index current-index))
-     ((and (stringp opencode-session-default-variant)
-           variants
-           (member opencode-session-default-variant variants))
-      (setq-local opencode-session--variant opencode-session-default-variant)
-      (setq-local opencode-session--variant-index
-                  (cl-position opencode-session-default-variant variants :test #'string=)))
-     (t
-      (setq-local opencode-session--variant nil)
-      (setq-local opencode-session--variant-index nil)))))
+         (variant (opencode-session--current-variant))
+         (index (and variant variants
+                     (cl-position variant variants :test #'string=))))
+    (setq-local opencode-session--variant-index index)))
 
 (defun opencode-session--set-variant (variant index)
-  "Set model VARIANT at INDEX for the current session buffer."
-  (setq-local opencode-session--variant variant)
-  (setq-local opencode-session--variant-index (and variant index))
-  (opencode-session--render-header)
-  (message "OpenCode variant: %s" (or variant "none")))
+  "Select model VARIANT at INDEX for the current session buffer.
+
+Asks the server to apply VARIANT to the active model; passing nil
+clears the variant.  INDEX is kept as the menu cursor until the server
+confirms the selection."
+  (let ((model (opencode-session--current-model)))
+    (unless model
+      (error "Select a model first"))
+    (setq-local opencode-session--variant-index (and variant index))
+    (opencode-session--post-model (cdr model) (car model) variant)
+    (opencode-session--render-header)
+    (message "OpenCode variant: %s" (or variant "none"))))
 
 (defconst opencode-session--no-variant-label "none"
   "Completion label representing no active model variant.")
@@ -625,11 +812,11 @@ ON-SUCCESS is called when providers are loaded."
        (when (buffer-live-p buffer)
          (with-current-buffer buffer
            (opencode-session--ensure-providers connection)
-           (unless (opencode-session--active-model)
+           (unless (opencode-session--current-model)
              (error "Select a model first"))
            (let* ((variants (or (opencode-session--available-variants) nil))
                   (choices (cons opencode-session--no-variant-label variants))
-                  (initial (or opencode-session--variant
+                  (initial (or (opencode-session--current-variant)
                                opencode-session-default-variant
                                opencode-session--no-variant-label))
                   (variant (completing-read "OpenCode variant: " choices nil t nil nil initial)))
@@ -651,14 +838,15 @@ ON-SUCCESS is called when providers are loaded."
        (when (buffer-live-p buffer)
          (with-current-buffer buffer
            (opencode-session--ensure-providers connection)
-           (unless (opencode-session--active-model)
+           (unless (opencode-session--current-model)
              (error "Select a model first"))
            (let* ((variants (or (opencode-session--available-variants) nil))
                   (cycle-values (cons nil variants))
                   (count (length cycle-values))
-                  (current (or (and opencode-session--variant
-                                    (let ((index (cl-position opencode-session--variant variants
-                                                              :test #'string=)))
+                  (current (or (and (opencode-session--current-variant)
+                                    (let ((index (cl-position (opencode-session--current-variant)
+                                                               variants
+                                                               :test #'string=)))
                                       (and index (1+ index))))
                                0))
                   (next (mod (+ current step) count))

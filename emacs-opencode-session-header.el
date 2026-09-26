@@ -8,6 +8,9 @@
 (require 'emacs-opencode-session)
 
 (declare-function opencode-session--ensure-providers "emacs-opencode-session-model")
+(declare-function opencode-session--current-agent "emacs-opencode-session-model")
+(declare-function opencode-session--current-model "emacs-opencode-session-model")
+(declare-function opencode-session--current-variant "emacs-opencode-session-model")
 (declare-function opencode-session--render-retry-banner "emacs-opencode-session-render")
 
 (defcustom opencode-session-spinner-frames
@@ -62,7 +65,7 @@
   (let* ((title (or (opencode-session-title opencode-session--session)
                     "OpenCode Session"))
           (status (opencode-session-status opencode-session--session))
-          (agent opencode-session--agent)
+          (agent (opencode-session--current-agent))
           (agent-label (when (and agent (not (string-empty-p agent)))
                          (format "[%s]" agent)))
           (spinner (opencode-session--header-spinner-segment status))
@@ -152,38 +155,20 @@ RIGHT is aligned to the far edge when provided."
 
 (defun opencode-session--header-model-string ()
   "Return the active provider/model string for the session header."
-  (when-let* ((model (opencode-session--active-model)))
+  (when-let* ((model (opencode-session--current-model)))
     (format "%s/%s" (car model) (cdr model))))
 
 (defun opencode-session--header-variant-string ()
   "Return the active variant string for the session header."
-  (when (and (opencode-session--header-model-string)
-             (stringp opencode-session--variant)
-             (not (string-empty-p opencode-session--variant)))
-    (format "[%s]" opencode-session--variant)))
-
-(defun opencode-session--active-model ()
-  "Return active (PROVIDER-ID . MODEL-ID) for this buffer."
-  (or (and opencode-session--provider-id opencode-session--model-id
-           (cons opencode-session--provider-id opencode-session--model-id))
-      (opencode-session--last-message-model)))
-
-(defun opencode-session--last-message-model ()
-  "Return the latest (PROVIDER-ID . MODEL-ID) from session messages."
-  (cl-loop for message in (reverse opencode-session--messages)
-           for provider-id = (opencode-message-provider-id message)
-           for model-id = (opencode-message-model-id message)
-           when (and (stringp provider-id)
-                     (stringp model-id)
-                     (not (string-empty-p provider-id))
-                     (not (string-empty-p model-id)))
-           return (cons provider-id model-id)))
+  (when-let* ((variant (and (opencode-session--header-model-string)
+                            (opencode-session--current-variant))))
+    (format "[%s]" variant)))
 
 (defun opencode-session--session-used-models ()
   "Return distinct (PROVIDER-ID . MODEL-ID) pairs used in this session.
 Most recently used first."
   (let (seen result)
-    (dolist (message (reverse opencode-session--messages))
+    (dolist (message opencode-session--messages)
       (let* ((provider-id (opencode-message-provider-id message))
              (model-id (opencode-message-model-id message))
              (key (and (stringp provider-id)

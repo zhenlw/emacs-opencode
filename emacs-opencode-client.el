@@ -301,6 +301,48 @@ AGENTs are agent names mentioned in the text."
    :success success
    :error error))
 
+(defun opencode-client--model-ref (model-id provider-id &optional variant)
+  "Return a `Model.Ref' alist for MODEL-ID from PROVIDER-ID.
+
+VARIANT is included only when it is a non-empty string; the server
+treats a reference without `variant' as the model's default."
+  (let ((ref (list (cons 'id model-id)
+                   (cons 'providerID provider-id))))
+    (when (and (stringp variant) (not (string-empty-p variant)))
+      (setq ref (append ref (list (cons 'variant variant)))))
+    ref))
+
+(cl-defmethod opencode-client-session-set-model
+  ((conn opencode-connection) session-id model-ref &key success error)
+  "Switch SESSION-ID to the model reference MODEL-REF using CONN.
+
+MODEL-REF is a `Model.Ref' alist as built by `opencode-client--model-ref'.
+The server acknowledges the switch with 204 and no body; it records the
+selection and broadcasts it as a `session.model.selected' event."
+  (opencode-request
+   conn
+   'POST
+   (format "/api/session/%s/model" session-id)
+   :json `((model . ,model-ref))
+   :parser (lambda () nil)
+   :success success
+   :error error))
+
+(cl-defmethod opencode-client-session-set-agent
+  ((conn opencode-connection) session-id agent &key success error)
+  "Switch SESSION-ID to AGENT using CONN.
+
+The server records the selection and broadcasts it as a
+`session.agent.selected' event."
+  (opencode-request
+   conn
+   'POST
+   (format "/api/session/%s/agent" session-id)
+   :json `((agent . ,agent))
+   :parser (lambda () nil)
+   :success success
+   :error error))
+
 (cl-defmethod opencode-client-session-abort ((conn opencode-connection) session-id &key success error)
   "Abort the active prompt for SESSION-ID."
   (opencode-request

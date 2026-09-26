@@ -35,17 +35,20 @@ Each value is a cons (PARENT-SESSION-ID . TASK-PART-ID).")
 The authoritative input region is from
 `opencode-session--input-start-marker' through `point-max'.")
 
-(defvar-local opencode-session--agent nil
-  "Selected agent name for the current session buffer.")
+(defvar-local opencode-session--server-model nil
+  "Model selection reported by the server for this session buffer.
 
-(defvar-local opencode-session--provider-id nil
-  "Selected provider ID for the current session buffer.")
+An alist with `id' and `providerID' keys plus an optional `variant'
+key, exactly as the server sends it.  The server owns this value: it is
+seeded from the session's `model-switched' history and refreshed by
+`session.model.selected' events, so the client never picks a model on
+its own.")
 
-(defvar-local opencode-session--model-id nil
-  "Selected model ID for the current session buffer.")
+(defvar-local opencode-session--server-agent nil
+  "Agent name reported by the server for this session buffer.
 
-(defvar-local opencode-session--variant nil
-  "Selected model variant for the current session buffer.")
+Seeded from the session's `agent-switched' history and refreshed by
+`session.agent.selected' events.")
 
 (defvar-local opencode-session--show-reasoning nil
   "When non-nil, show reasoning/thinking blocks in this session buffer.

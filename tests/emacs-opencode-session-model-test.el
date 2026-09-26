@@ -1,6 +1,7 @@
 ;;; emacs-opencode-session-model-test.el --- Tests for model selection  -*- lexical-binding: t; -*-
 
 (require 'ert)
+(require 'emacs-opencode-session)
 (require 'emacs-opencode-session-model)
 
 ;;; normalize-agents
@@ -350,20 +351,25 @@
         (should (member "google/gemini-x (connected)" (car data))))
       (with-temp-buffer
         (setq-local opencode-session--connection conn)
-        (setq-local opencode-session--provider-id "google")
-        (setq-local opencode-session--model-id "gemini-x")
+        (setq-local opencode-session--server-model
+                    '((id . "gemini-x") (providerID . "google")))
         (should (equal (opencode-session--available-variants)
                        '("high" "low")))))))
 
 (ert-deftest test-opencode-model/prompt-model-selection-applies ()
-  "The extracted model prompt applies a connected selection."
-  (let ((conn (opencode-connection-create :directory "/tmp/")))
+  "The extracted model prompt asks the server to apply a connected selection."
+  (let ((conn (opencode-connection-create :directory "/tmp/"))
+        (sent nil))
     (cl-letf (((symbol-function 'opencode-client-providers)
                #'opencode-model-test--v2-providers)
               ((symbol-function 'opencode-client-models)
                #'opencode-model-test--v2-models)
               ((symbol-function 'opencode-session--session-used-models)
                #'ignore)
+              ((symbol-function 'opencode-client-session-set-model)
+               (lambda (_conn _session-id model-ref &rest args)
+                 (setq sent model-ref)
+                 (funcall (plist-get args :success))))
               ((symbol-function 'completing-read)
                (lambda (&rest _) "google/gemini-x (connected)"))
               ((symbol-function 'opencode-session--render-header)
@@ -371,9 +377,11 @@
       (opencode-connection-ensure-providers conn #'ignore #'ignore)
       (with-temp-buffer
         (setq-local opencode-session--connection conn)
+        (setq-local opencode-session--session
+                    (opencode-session-create :id "ses_1"))
         (opencode-session--prompt-model-selection (current-buffer))
-        (should (equal opencode-session--provider-id "google"))
-        (should (equal opencode-session--model-id "gemini-x"))))))
+        (should (equal sent '((id . "gemini-x") (providerID . "google"))))
+        (should (equal opencode-session--server-model sent))))))
 
 (ert-deftest test-opencode-model/wait-for-load-fires-when-ready ()
   "The load waiter calls back once the readiness check passes."
@@ -383,6 +391,178 @@
                                      "test")
     (sit-for 0.6)
     (should fired)))
+
+;;; Server-authoritative selection
+
+(defun opencode-model-test--message (id type fields)
+  "Return a message with ID and TYPE carrying the alist FIELDS."
+  (opencode-message-create
+   :id id
+   :role type
+   :info (append (list (cons 'id id) (cons 'type type)) fields)))
+
+(ert-deftest test-opencode-model/adopt-selection-uses-newest-switch-messages ()
+  "Selection messages seed the model and agent, newest first."
+  (with-temp-buffer
+    (setq-local opencode-session--messages
+                (list (opencode-model-test--message
+                       "m1" "model-switched"
+                       '((time . ((created . 100)))
+                         (model . ((id . "old") (providerID . "google")))))
+                      (opencode-model-test--message
+                       "m2" "model-switched"
+                       '((time . ((created . 300)))
+                         (model . ((id . "new") (providerID . "google")
+                                   (variant . "high")))))
+                      (opencode-model-test--message
+                       "m3" "agent-switched"
+                       '((time . ((created . 200))) (agent . "plan")))))
+    (opencode-session--adopt-selection-from-messages)
+    (should (equal (alist-get 'id opencode-session--server-model) "new"))
+    (should (equal (alist-get 'variant opencode-session--server-model) "high"))
+    (should (equal opencode-session--server-agent "plan"))))
+
+(ert-deftest test-opencode-model/adopt-selection-ignores-assistant-messages ()
+  "Assistant messages do not seed an explicit selection."
+  (with-temp-buffer
+    (setq-local opencode-session--messages
+                (list (opencode-model-test--message
+                       "m1" "assistant"
+                       '((time . ((created . 100)))
+                         (model . ((id . "used") (providerID . "google")))
+                         (agent . "build")))))
+    (opencode-session--adopt-selection-from-messages)
+    (should (null opencode-session--server-model))
+    (should (null opencode-session--server-agent))))
+
+(ert-deftest test-opencode-model/current-model-prefers-server-selection ()
+  "The recorded selection wins over the last assistant message."
+  (with-temp-buffer
+    (setq-local opencode-session--messages
+                (list (opencode-model-test--message
+                       "m1" "assistant"
+                       '((time . ((created . 100)))
+                         (model . ((id . "used") (providerID . "google")))))))
+    (setq-local opencode-session--server-model
+                '((id . "selected") (providerID . "opencode")))
+    (should (equal (opencode-session--current-model)
+                   '("opencode" . "selected")))
+    (should (null (opencode-session--current-variant)))))
+
+(ert-deftest test-opencode-model/current-model-falls-back-to-assistant ()
+  "Without a selection the newest assistant model is used."
+  (with-temp-buffer
+    (setq-local opencode-session--messages
+                (list (opencode-model-test--message
+                       "m1" "model-switched"
+                       '((time . ((created . 100)))
+                         (model . ((id . "gemini-x") (providerID . "google")
+                                   (variant . "low")))))
+                      (opencode-model-test--message
+                       "m2" "assistant"
+                       '((time . ((created . 200)))
+                         (model . ((id . "used") (providerID . "opencode")))
+                         (agent . "build")))))
+    (should (equal (opencode-session--current-model) '("opencode" . "used")))
+    (should (equal (opencode-session--current-agent) "build"))
+    (should (null (opencode-session--current-variant)))))
+
+(ert-deftest test-opencode-model/current-model-uses-server-variant ()
+  "The variant comes from the server's model reference."
+  (with-temp-buffer
+    (setq-local opencode-session--server-model
+                '((id . "gemini-x") (providerID . "google") (variant . "high")))
+    (should (equal (opencode-session--current-variant) "high"))))
+
+(ert-deftest test-opencode-model/current-variant-falls-back-to-used-variant ()
+  "A selection without a variant uses the variant of the last turn."
+  (with-temp-buffer
+    (setq-local opencode-session--messages
+                (list (opencode-model-test--message
+                       "m1" "assistant"
+                       '((time . ((created . 100)))
+                         (model . ((id . "gemini-x") (providerID . "google")
+                                   (variant . "low")))))))
+    (setq-local opencode-session--server-model
+                '((id . "gemini-x") (providerID . "google")))
+    (should (equal (opencode-session--current-variant) "low"))))
+
+(ert-deftest test-opencode-model/current-variant-ignores-other-used-models ()
+  "The fallback variant only applies to the same model."
+  (with-temp-buffer
+    (setq-local opencode-session--messages
+                (list (opencode-model-test--message
+                       "m1" "assistant"
+                       '((time . ((created . 100)))
+                         (model . ((id . "other") (providerID . "google")
+                                   (variant . "low")))))))
+    (setq-local opencode-session--server-model
+                '((id . "gemini-x") (providerID . "google")))
+    (should (null (opencode-session--current-variant)))))
+
+(ert-deftest test-opencode-model/current-agent-falls-back-to-default ()
+  "Without any server or message agent the configured default is shown."
+  (with-temp-buffer
+    (let ((opencode-session-default-agent "plan"))
+      (should (equal (opencode-session--current-agent) "plan")))))
+
+(ert-deftest test-opencode-model/set-agent-asks-the-server ()
+  "Selecting an agent posts the switch and moves the menu cursor."
+  (let ((sent nil))
+    (with-temp-buffer
+      (setq-local opencode-session--connection
+                  (opencode-connection-create :directory "/tmp/"))
+      (setq-local opencode-session--session (opencode-session-create :id "ses_1"))
+      (cl-letf (((symbol-function 'opencode-client-session-set-agent)
+                 (lambda (_conn session-id agent &rest args)
+                   (setq sent (cons session-id agent))
+                   (funcall (plist-get args :success))))
+                ((symbol-function 'opencode-session--render-header) #'ignore))
+        (opencode-session--set-agent "build" 2))
+      (should (equal sent '("ses_1" . "build")))
+      (should (equal opencode-session--server-agent "build")))))
+
+(ert-deftest test-opencode-model/set-variant-posts-model-with-variant ()
+  "Selecting a variant re-posts the active model with that variant."
+  (let ((sent nil))
+    (with-temp-buffer
+      (setq-local opencode-session--connection
+                  (opencode-connection-create :directory "/tmp/"))
+      (setq-local opencode-session--session (opencode-session-create :id "ses_1"))
+      (setq-local opencode-session--server-model
+                  '((id . "gemini-x") (providerID . "google")))
+      (cl-letf (((symbol-function 'opencode-client-session-set-model)
+                 (lambda (_conn _session-id model-ref &rest args)
+                   (setq sent model-ref)
+                   (funcall (plist-get args :success))))
+                ((symbol-function 'opencode-session--render-header) #'ignore))
+        (opencode-session--set-variant "high" 1)))
+    (should (equal sent '((id . "gemini-x") (providerID . "google")
+                          (variant . "high"))))))
+
+(ert-deftest test-opencode-model/clear-variant-posts-model-without-variant ()
+  "Clearing the variant re-posts the model without a variant."
+  (let ((sent nil))
+    (with-temp-buffer
+      (setq-local opencode-session--connection
+                  (opencode-connection-create :directory "/tmp/"))
+      (setq-local opencode-session--session (opencode-session-create :id "ses_1"))
+      (setq-local opencode-session--server-model
+                  '((id . "gemini-x") (providerID . "google") (variant . "high")))
+      (cl-letf (((symbol-function 'opencode-client-session-set-model)
+                 (lambda (_conn _session-id model-ref &rest args)
+                   (setq sent model-ref)
+                   (funcall (plist-get args :success))))
+                ((symbol-function 'opencode-session--render-header) #'ignore))
+        (opencode-session--set-variant nil nil))
+      (should (equal sent '((id . "gemini-x") (providerID . "google"))))
+      (should (null (opencode-session--current-variant))))))
+
+(ert-deftest test-opencode-model/post-model-requires-a-session ()
+  "Asking the server to switch the model needs a session buffer."
+  (with-temp-buffer
+    (should-error (opencode-session--post-model "gemini-x" "google" nil)
+                  :type 'error)))
 
 (provide 'emacs-opencode-session-model-test)
 

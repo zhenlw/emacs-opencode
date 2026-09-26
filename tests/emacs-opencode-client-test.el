@@ -256,6 +256,56 @@ last `request' call made during BODY."
       (should (equal (plist-get args :data)
                      (json-encode '((command . "ls"))))))))
 
+;;; session-set-model
+
+(ert-deftest test-opencode-client/session-set-model-posts-model-ref ()
+  "Switching the model posts a Model.Ref with id and providerID."
+  (let ((conn (opencode-client-test--connection "/tmp/project/")))
+    (opencode-client-test--with-captured-request url args
+      (opencode-client-session-set-model
+       conn "ses_1" (opencode-client--model-ref "gemini-x" "google")
+       :success #'ignore :error #'ignore)
+      (should (equal url "http://127.0.0.1:4096/api/session/ses_1/model"))
+      (should (equal (plist-get args :type) "POST"))
+      (should (equal (plist-get args :data)
+                     (json-encode '((model . ((id . "gemini-x")
+                                              (providerID . "google"))))))))))
+
+(ert-deftest test-opencode-client/session-set-model-includes-variant ()
+  "A variant is nested in the model reference when provided."
+  (let ((conn (opencode-client-test--connection "/tmp/project/")))
+    (opencode-client-test--with-captured-request _url args
+      (opencode-client-session-set-model
+       conn "ses_1" (opencode-client--model-ref "gemini-x" "google" "high")
+       :success #'ignore :error #'ignore)
+      (should (equal (plist-get args :data)
+                     (json-encode '((model . ((id . "gemini-x")
+                                              (providerID . "google")
+                                              (variant . "high"))))))))))
+
+(ert-deftest test-opencode-client/session-set-model-omits-empty-variant ()
+  "An empty variant is omitted so the server keeps the model default."
+  (let ((conn (opencode-client-test--connection "/tmp/project/")))
+    (opencode-client-test--with-captured-request _url args
+      (opencode-client-session-set-model
+       conn "ses_1" (opencode-client--model-ref "gemini-x" "google" "")
+       :success #'ignore :error #'ignore)
+      (should (equal (plist-get args :data)
+                     (json-encode '((model . ((id . "gemini-x")
+                                              (providerID . "google"))))))))))
+
+;;; session-set-agent
+
+(ert-deftest test-opencode-client/session-set-agent-posts-agent ()
+  "Switching the agent posts the agent name."
+  (let ((conn (opencode-client-test--connection "/tmp/project/")))
+    (opencode-client-test--with-captured-request url args
+      (opencode-client-session-set-agent conn "ses_1" "plan"
+                                        :success #'ignore :error #'ignore)
+      (should (equal url "http://127.0.0.1:4096/api/session/ses_1/agent"))
+      (should (equal (plist-get args :type) "POST"))
+      (should (equal (plist-get args :data) (json-encode '((agent . "plan"))))))))
+
 ;;; form-reply
 
 (ert-deftest test-opencode-client/form-reply-sends-answer ()

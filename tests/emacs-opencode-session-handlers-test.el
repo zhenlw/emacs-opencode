@@ -155,6 +155,60 @@
                  '((permission . "custom")))))
     (should (string-match-p "use custom" result))))
 
+;;; model and agent selection events
+
+(defmacro opencode-handlers-test--with-session-buffer (var &rest body)
+  "Bind VAR to a live session buffer registered as \"s1\" and run BODY."
+  (declare (indent 1))
+  `(let ((opencode-session--buffers (make-hash-table :test 'equal))
+         (,var (generate-new-buffer " *oc-selection-test*")))
+     (unwind-protect
+         (with-current-buffer ,var
+           (opencode-session-mode)
+           (setq-local opencode-session--session
+                       (opencode-session-create :id "s1"))
+           (puthash "s1" ,var opencode-session--buffers)
+           ,@body)
+       (when (buffer-live-p ,var)
+         (kill-buffer ,var)))))
+
+(ert-deftest test-opencode-handlers/model-selected-updates-server-model ()
+  "A session.model.selected event records the new model reference."
+  (opencode-handlers-test--with-session-buffer buffer
+    (opencode-session--handle-model-selected
+     "session.model.selected"
+     '((properties . ((sessionID . "s1")
+                      (model . ((id . "gemini-x") (providerID . "google")
+                                (variant . "high")))))))
+    (should (equal (alist-get 'id opencode-session--server-model) "gemini-x"))
+    (should (equal (alist-get 'variant opencode-session--server-model) "high"))
+    (should (equal (opencode-session--current-model) '("google" . "gemini-x")))))
+
+(ert-deftest test-opencode-handlers/model-selected-ignores-other-sessions ()
+  "A model selection for another session does not touch this buffer."
+  (opencode-handlers-test--with-session-buffer _buffer
+    (opencode-session--handle-model-selected
+     "session.model.selected"
+     '((properties . ((sessionID . "other")
+                      (model . ((id . "gemini-x") (providerID . "google")))))))
+    (should (null opencode-session--server-model))))
+
+(ert-deftest test-opencode-handlers/agent-selected-updates-server-agent ()
+  "A session.agent.selected event records the new agent."
+  (opencode-handlers-test--with-session-buffer _buffer
+    (opencode-session--handle-agent-selected
+     "session.agent.selected"
+     '((properties . ((sessionID . "s1") (agent . "plan")))))
+    (should (equal opencode-session--server-agent "plan"))
+    (should (equal (opencode-session--current-agent) "plan"))))
+
+(ert-deftest test-opencode-handlers/selection-events-are-registered ()
+  "The selection events are registered with the SSE dispatcher."
+  (should (alist-get "session.model.selected"
+                     opencode-sse--handlers nil nil #'string=))
+  (should (alist-get "session.agent.selected"
+                     opencode-sse--handlers nil nil #'string=)))
+
 ;;; event-file-paths
 
 (ert-deftest test-opencode-handlers/compaction-started-renders-marker ()
