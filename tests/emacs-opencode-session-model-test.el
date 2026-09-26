@@ -118,35 +118,47 @@
 
 ;;; model-candidate-tier
 
-(ert-deftest test-opencode-model/candidate-tier-recent ()
-  "Recently selected models are tier 0."
+(ert-deftest test-opencode-model/candidate-tier-favorite ()
+  "Favorite models are tier 0."
   (let ((candidate (list :provider-id "anthropic" :model-id "claude-3" :connected-p nil)))
     (should (= (opencode-session--model-candidate-tier
                 candidate
                 '(("anthropic" . "claude-3"))
+                nil
                 nil)
                0))))
 
+(ert-deftest test-opencode-model/candidate-tier-recent ()
+  "Recently selected models are tier 1."
+  (let ((candidate (list :provider-id "anthropic" :model-id "claude-3" :connected-p nil)))
+    (should (= (opencode-session--model-candidate-tier
+                candidate
+                nil
+                '(("anthropic" . "claude-3"))
+                nil)
+               1))))
+
 (ert-deftest test-opencode-model/candidate-tier-session ()
-  "Session-used models are tier 1."
+  "Session-used models are tier 2."
   (let ((candidate (list :provider-id "openai" :model-id "gpt-4" :connected-p nil)))
     (should (= (opencode-session--model-candidate-tier
                 candidate
                 nil
+                nil
                 '(("openai" . "gpt-4")))
-               1))))
-
-(ert-deftest test-opencode-model/candidate-tier-connected ()
-  "Connected models are tier 2."
-  (let ((candidate (list :provider-id "openai" :model-id "gpt-4" :connected-p t)))
-    (should (= (opencode-session--model-candidate-tier candidate nil nil)
                2))))
 
-(ert-deftest test-opencode-model/candidate-tier-other ()
-  "Other models are tier 3."
-  (let ((candidate (list :provider-id "openai" :model-id "gpt-4" :connected-p nil)))
-    (should (= (opencode-session--model-candidate-tier candidate nil nil)
+(ert-deftest test-opencode-model/candidate-tier-connected ()
+  "Connected models are tier 3."
+  (let ((candidate (list :provider-id "openai" :model-id "gpt-4" :connected-p t)))
+    (should (= (opencode-session--model-candidate-tier candidate nil nil nil)
                3))))
+
+(ert-deftest test-opencode-model/candidate-tier-other ()
+  "Other models are tier 4."
+  (let ((candidate (list :provider-id "openai" :model-id "gpt-4" :connected-p nil)))
+    (should (= (opencode-session--model-candidate-tier candidate nil nil nil)
+               4))))
 
 ;;; model-candidate-rank
 
@@ -162,9 +174,9 @@
     (should (= (opencode-session--model-candidate-rank candidate 0 nil) 0))))
 
 (ert-deftest test-opencode-model/candidate-rank-high-tier ()
-  "Tier > 1 always returns rank 0."
+  "Tier > 2 always returns rank 0."
   (let ((candidate (list :provider-id "x" :model-id "y")))
-    (should (= (opencode-session--model-candidate-rank candidate 2 nil) 0))))
+    (should (= (opencode-session--model-candidate-rank candidate 3 nil) 0))))
 
 ;;; provider-model-items
 
@@ -358,8 +370,10 @@
 
 (ert-deftest test-opencode-model/prompt-model-selection-applies ()
   "The extracted model prompt asks the server to apply a connected selection."
-  (let ((conn (opencode-connection-create :directory "/tmp/"))
-        (sent nil))
+  (opencode-model-test--with-pref-dir
+   (setq opencode-session--preferences-loaded t)
+   (let ((conn (opencode-connection-create :directory "/tmp/"))
+         (sent nil))
     (cl-letf (((symbol-function 'opencode-client-providers)
                #'opencode-model-test--v2-providers)
               ((symbol-function 'opencode-client-models)
@@ -381,7 +395,7 @@
                     (opencode-session-create :id "ses_1"))
         (opencode-session--prompt-model-selection (current-buffer))
         (should (equal sent '((id . "gemini-x") (providerID . "google"))))
-        (should (equal opencode-session--server-model sent))))))
+        (should (equal opencode-session--server-model sent)))))))
 
 (ert-deftest test-opencode-model/wait-for-load-fires-when-ready ()
   "The load waiter calls back once the readiness check passes."
@@ -524,25 +538,29 @@
 
 (ert-deftest test-opencode-model/set-variant-posts-model-with-variant ()
   "Selecting a variant re-posts the active model with that variant."
-  (let ((sent nil))
-    (with-temp-buffer
-      (setq-local opencode-session--connection
-                  (opencode-connection-create :directory "/tmp/"))
-      (setq-local opencode-session--session (opencode-session-create :id "ses_1"))
-      (setq-local opencode-session--server-model
-                  '((id . "gemini-x") (providerID . "google")))
-      (cl-letf (((symbol-function 'opencode-client-session-set-model)
-                 (lambda (_conn _session-id model-ref &rest args)
-                   (setq sent model-ref)
-                   (funcall (plist-get args :success))))
-                ((symbol-function 'opencode-session--render-header) #'ignore))
-        (opencode-session--set-variant "high" 1)))
-    (should (equal sent '((id . "gemini-x") (providerID . "google")
-                          (variant . "high"))))))
+  (opencode-model-test--with-pref-dir
+    (setq opencode-session--preferences-loaded t)
+    (let ((sent nil))
+      (with-temp-buffer
+        (setq-local opencode-session--connection
+                    (opencode-connection-create :directory "/tmp/"))
+        (setq-local opencode-session--session (opencode-session-create :id "ses_1"))
+        (setq-local opencode-session--server-model
+                    '((id . "gemini-x") (providerID . "google")))
+        (cl-letf (((symbol-function 'opencode-client-session-set-model)
+                   (lambda (_conn _session-id model-ref &rest args)
+                     (setq sent model-ref)
+                     (funcall (plist-get args :success))))
+                  ((symbol-function 'opencode-session--render-header) #'ignore))
+          (opencode-session--set-variant "high" 1)))
+      (should (equal sent '((id . "gemini-x") (providerID . "google")
+                            (variant . "high")))))))
 
 (ert-deftest test-opencode-model/clear-variant-posts-model-without-variant ()
   "Clearing the variant re-posts the model without a variant."
-  (let ((sent nil))
+  (opencode-model-test--with-pref-dir
+   (setq opencode-session--preferences-loaded t)
+   (let ((sent nil))
     (with-temp-buffer
       (setq-local opencode-session--connection
                   (opencode-connection-create :directory "/tmp/"))
@@ -554,9 +572,223 @@
                    (setq sent model-ref)
                    (funcall (plist-get args :success))))
                 ((symbol-function 'opencode-session--render-header) #'ignore))
-        (opencode-session--set-variant nil nil))
-      (should (equal sent '((id . "gemini-x") (providerID . "google"))))
-      (should (null (opencode-session--current-variant))))))
+        (opencode-session--set-variant nil nil)
+        (should (equal sent '((id . "gemini-x") (providerID . "google"))))
+        (should (null (opencode-session--current-variant))))))))
+
+(ert-deftest test-opencode-model/default-ref-from-info-extracts-ref ()
+  "A default Model.Info yields a Model.Ref with id and providerID."
+  (should (equal (opencode-session--default-ref-from-info
+                  '((id . "gemini-x") (providerID . "google")
+                    (name . "Gemini X")))
+                 '((id . "gemini-x") (providerID . "google")))))
+
+(ert-deftest test-opencode-model/default-ref-from-info-unwraps-envelope ()
+  "A default response envelope is unwrapped before extraction."
+  (should (equal (opencode-session--default-ref-from-info
+                  '((data . ((id . "gemini-x") (providerID . "google")))))
+                 '((id . "gemini-x") (providerID . "google")))))
+
+(ert-deftest test-opencode-model/default-ref-from-info-rejects-junk ()
+  "Missing ids yield no reference."
+  (should (null (opencode-session--default-ref-from-info nil)))
+  (should (null (opencode-session--default-ref-from-info '((name . "x"))))))
+
+(ert-deftest test-opencode-model/fetch-default-applies-when-unselected ()
+  "An unselected session records the fetched default as its model."
+  (opencode-model-test--with-pref-dir
+    (setq opencode-session--preferences-loaded t)
+    (with-temp-buffer
+      (let ((conn (opencode-connection-create :directory "/tmp/")))
+        (setq-local opencode-session--connection conn)
+        (cl-letf (((symbol-function 'opencode-client-model-default)
+                   (lambda (_conn &rest args)
+                     (funcall (plist-get args :success)
+                              :data '((id . "gemini-x")
+                                      (providerID . "google")))))
+                  ((symbol-function 'opencode-session--render-header) #'ignore))
+          (opencode-session--fetch-default-model))
+        (should (equal (alist-get 'id opencode-session--server-model)
+                       "gemini-x"))))))
+
+(ert-deftest test-opencode-model/fetch-default-skips-when-selected ()
+  "A session with an explicit selection never fetches the default."
+  (with-temp-buffer
+    (let ((conn (opencode-connection-create :directory "/tmp/"))
+          (called nil))
+      (setq-local opencode-session--connection conn)
+      (setq-local opencode-session--server-model
+                  '((id . "picked") (providerID . "google")))
+      (cl-letf (((symbol-function 'opencode-client-model-default)
+                 (lambda (_conn &rest _args) (setq called t))))
+        (opencode-session--fetch-default-model))
+      (should (null called)))))
+
+(ert-deftest test-opencode-model/resolve-prefers-remembered-over-default ()
+  "A remembered model wins; the default endpoint is never hit."
+  (opencode-model-test--with-pref-dir
+    (setq opencode-session--preferences-loaded t)
+    (setq opencode-session--recent-models '(("google" . "gemini-x")))
+    (with-temp-buffer
+      (let ((conn (opencode-connection-create :directory "/tmp/"))
+            (called nil))
+        (setq-local opencode-session--connection conn)
+        (setq-local opencode-session--session
+                    (opencode-session-create :id "ses_1"))
+        (cl-letf (((symbol-function 'opencode-client-model-default)
+                   (lambda (_conn &rest _args) (setq called t)))
+                  ((symbol-function 'opencode-session--render-header) #'ignore))
+          (opencode-session--resolve-initial-model))
+        (should (null called))
+        (should (equal (opencode-session--current-model)
+                       '("google" . "gemini-x")))))))
+
+(ert-deftest test-opencode-model/resolve-prefers-info-over-remembered ()
+  "A session born selected keeps its own model, not the remembered one."
+  (opencode-model-test--with-pref-dir
+    (setq opencode-session--preferences-loaded t)
+    (setq opencode-session--recent-models '(("google" . "gemini-x")))
+    (with-temp-buffer
+      (let ((conn (opencode-connection-create :directory "/tmp/"))
+            (called nil))
+        (setq-local opencode-session--connection conn)
+        (setq-local opencode-session--session
+                    (opencode-session-create
+                     :id "ses_1"
+                     :info '((agent . "build")
+                             (model . ((id . "bunny")
+                                       (providerID . "opencode"))))))
+        (cl-letf (((symbol-function 'opencode-client-model-default)
+                   (lambda (_conn &rest _args) (setq called t)))
+                  ((symbol-function 'opencode-session--render-header) #'ignore))
+          (opencode-session--resolve-initial-model))
+        (should (null called))
+        (should (equal (opencode-session--current-model)
+                       '("opencode" . "bunny")))
+        (should (equal (opencode-session--current-agent) "build"))))))
+
+(ert-deftest test-opencode-model/resolve-fetches-default-last-resort ()
+  "With nothing remembered, the server default is fetched."
+  (opencode-model-test--with-pref-dir
+    (setq opencode-session--preferences-loaded t)
+    (with-temp-buffer
+      (let ((conn (opencode-connection-create :directory "/tmp/"))
+            (called nil))
+        (setq-local opencode-session--connection conn)
+        (setq-local opencode-session--session
+                    (opencode-session-create :id "ses_1"))
+        (cl-letf (((symbol-function 'opencode-client-model-default)
+                   (lambda (_conn &rest args)
+                     (setq called t)
+                     (funcall (plist-get args :success)
+                              :data '((id . "fallback")
+                                      (providerID . "opencode")))))
+                  ((symbol-function 'opencode-session--render-header) #'ignore))
+          (opencode-session--resolve-initial-model))
+        (should called)
+        (should (equal (opencode-session--current-model)
+                       '("opencode" . "fallback")))))))
+
+(defmacro opencode-model-test--with-pref-dir (&rest body)
+  "Run BODY with a temp XDG_STATE_HOME and unloaded preferences."
+  (declare (indent 0))
+  `(let ((opencode-session--preferences-loaded nil)
+         (opencode-session--recent-models nil)
+         (opencode-session--favorite-models nil)
+         (opencode-session--model-variant-map nil)
+         (process-environment
+          (cons (concat "XDG_STATE_HOME="
+                        (make-temp-file "oc-state" t))
+                process-environment)))
+     ,@body))
+
+(ert-deftest test-opencode-model/preferences-roundtrip ()
+  "Recents, favorites, and variants survive a save/load cycle."
+  (opencode-model-test--with-pref-dir
+    (setq opencode-session--recent-models '(("google" . "gemini-x")))
+    (setq opencode-session--favorite-models '(("opencode" . "bunny")))
+    (setq opencode-session--model-variant-map '(("google/gemini-x" . "high")))
+    (opencode-session--save-preferences)
+    (setq opencode-session--recent-models nil
+          opencode-session--favorite-models nil
+          opencode-session--model-variant-map nil
+          opencode-session--preferences-loaded nil)
+    (opencode-session--ensure-preferences)
+    (should (equal opencode-session--recent-models '(("google" . "gemini-x"))))
+    (should (equal opencode-session--favorite-models '(("opencode" . "bunny"))))
+    (should (equal (opencode-session--remembered-variant "google" "gemini-x")
+                   "high"))))
+
+(ert-deftest test-opencode-model/preferences-load-missing-file ()
+  "A missing preference file leaves empty lists without error."
+  (opencode-model-test--with-pref-dir
+    (opencode-session--ensure-preferences)
+    (should (null opencode-session--recent-models))
+    (should (null opencode-session--favorite-models))
+    (should (null (opencode-session--remembered-model)))))
+
+(ert-deftest test-opencode-model/remembered-model-prefers-recent ()
+  "The remembered model is the most recent pick, never a favorite."
+  (opencode-model-test--with-pref-dir
+    (setq opencode-session--preferences-loaded t)
+    (setq opencode-session--recent-models '(("google" . "gemini-x")))
+    (setq opencode-session--favorite-models '(("opencode" . "bunny")))
+    (should (equal (opencode-session--remembered-model)
+                   '("google" . "gemini-x")))
+    (setq opencode-session--recent-models nil)
+    (should (null (opencode-session--remembered-model)))))
+
+(ert-deftest test-opencode-model/remembered-model-ref-includes-variant ()
+  "The remembered ref carries the persisted variant."
+  (opencode-model-test--with-pref-dir
+    (setq opencode-session--preferences-loaded t)
+    (setq opencode-session--recent-models '(("google" . "gemini-x")))
+    (setq opencode-session--model-variant-map '(("google/gemini-x" . "high")))
+    (should (equal (opencode-session--remembered-model-ref)
+                   '((id . "gemini-x") (providerID . "google")
+                     (variant . "high"))))))
+
+(ert-deftest test-opencode-model/record-recent-persists ()
+  "Recording a recent writes it to the preference file."
+  (opencode-model-test--with-pref-dir
+    (opencode-session--record-recent "google" "gemini-x")
+    (should (equal opencode-session--recent-models '(("google" . "gemini-x"))))
+    (setq opencode-session--recent-models nil
+          opencode-session--preferences-loaded nil)
+    (opencode-session--ensure-preferences)
+    (should (equal opencode-session--recent-models '(("google" . "gemini-x"))))))
+
+(ert-deftest test-opencode-model/toggle-favorite-adds-and-removes ()
+  "Toggling a favorite adds it, toggling again removes it."
+  (opencode-model-test--with-pref-dir
+    (setq opencode-session--preferences-loaded t)
+    (with-temp-buffer
+      (opencode-session-mode)
+      (setq-local opencode-session--server-model
+                  '((id . "gemini-x") (providerID . "google")))
+      (opencode-session-toggle-model-favorite)
+      (should (equal opencode-session--favorite-models
+                     '(("google" . "gemini-x"))))
+      (opencode-session-toggle-model-favorite)
+      (should (null opencode-session--favorite-models)))))
+
+(ert-deftest test-opencode-model/set-variant-records-preference ()
+  "Selecting a variant persists it for the model."
+  (opencode-model-test--with-pref-dir
+    (setq opencode-session--preferences-loaded t)
+    (with-temp-buffer
+      (setq-local opencode-session--connection
+                  (opencode-connection-create :directory "/tmp/"))
+      (setq-local opencode-session--session (opencode-session-create :id "ses_1"))
+      (setq-local opencode-session--server-model
+                  '((id . "gemini-x") (providerID . "google")))
+      (cl-letf (((symbol-function 'opencode-client-session-set-model)
+                 (lambda (_conn _session-id _ref &rest args)
+                   (funcall (plist-get args :success))))
+                ((symbol-function 'opencode-session--render-header) #'ignore))
+        (opencode-session--set-variant "high" 1)))
+    (should (equal (opencode-session--remembered-variant "google" "gemini-x")
+                   "high"))))
 
 (ert-deftest test-opencode-model/post-model-requires-a-session ()
   "Asking the server to switch the model needs a session buffer."

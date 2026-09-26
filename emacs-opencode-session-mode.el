@@ -23,6 +23,8 @@
 (declare-function opencode-session--sync-agent-index "emacs-opencode-session-model")
 (declare-function opencode-session--adopt-selection-from-messages
                   "emacs-opencode-session-model")
+(declare-function opencode-session--fetch-default-model
+                  "emacs-opencode-session-model")
 
 (defcustom opencode-session-input-prompt "❯ "
   "Prompt string shown before the session input area."
@@ -938,6 +940,16 @@ one under its `data' key."
     (setf (opencode-session-time-updated opencode-session--session) updated)
     (setf (opencode-session-summary opencode-session--session) (alist-get 'summary info))
     (setf (opencode-session-info opencode-session--session) info)
+    ;; A session born selected (e.g. created by the TUI with an explicit
+    ;; agent and model) carries the selection in its info but has no
+    ;; switch messages yet, so adopt it here.  Null fields never clobber
+    ;; a recorded selection: unselected sessions simply report null.
+    (let ((model (alist-get 'model info))
+          (agent (alist-get 'agent info)))
+      (when (consp model)
+        (opencode-session--set-server-model model))
+      (when (stringp agent)
+        (opencode-session--set-server-agent agent)))
     (opencode-session--rename-buffer previous-name)
     (opencode-session--render-header)))
 
@@ -1158,7 +1170,8 @@ Call ON-HISTORY-LOADED with BUFFER after the request completes."
                        item (opencode-session-id session)))
                     (opencode-session--adopt-selection-from-messages)
                     (opencode-session--render-buffer)
-                    (opencode-session--render-header))
+                    (opencode-session--render-header)
+                    (opencode-session--fetch-default-model))
                   (when on-history-loaded
                     (funcall on-history-loaded buffer)))))
    :error (lambda (&rest _args)

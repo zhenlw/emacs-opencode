@@ -8,6 +8,9 @@
 (require 'emacs-opencode-run)
 (require 'emacs-opencode-session)
 (require 'emacs-opencode-session-mode)
+(require 'emacs-opencode-session-model)
+
+(declare-function opencode-session--remembered-model-ref "emacs-opencode-session-model")
 
 (defgroup emacs-opencode nil
   "Emacs client for the OpenCode server."
@@ -307,6 +310,8 @@ once the server is ready."
      (lambda (connection)
        (opencode-client-session-create
         connection
+        :agent opencode-session-default-agent
+        :model (opencode-session--remembered-model-ref)
         :success (lambda (&rest args)
                    (let* ((data (plist-get args :data))
                           (session (opencode--session-from-data data)))
@@ -329,6 +334,8 @@ once the server is ready."
      (lambda (connection)
        (opencode-client-session-create
         connection
+        :agent opencode-session-default-agent
+        :model (opencode-session--remembered-model-ref)
         :success (lambda (&rest args)
                    (let* ((data (plist-get args :data))
                           (session (opencode--session-from-data data)))

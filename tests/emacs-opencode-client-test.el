@@ -306,6 +306,43 @@ last `request' call made during BODY."
       (should (equal (plist-get args :type) "POST"))
       (should (equal (plist-get args :data) (json-encode '((agent . "plan"))))))))
 
+;;; session-create with agent and model
+
+(ert-deftest test-opencode-client/session-create-sends-agent-and-model ()
+  "New sessions are born selected when agent and model are given."
+  (let ((conn (opencode-client-test--connection "/tmp/project/")))
+    (opencode-client-test--with-captured-request _url args
+      (opencode-client-session-create
+       conn
+       :agent "build"
+       :model '((id . "gemini-x") (providerID . "google") (variant . "high"))
+       :success #'ignore :error #'ignore)
+      (should (equal (plist-get args :data)
+                     (json-encode '((location . ((directory . "/tmp/project")))
+                                    (agent . "build")
+                                    (model . ((id . "gemini-x")
+                                              (providerID . "google")
+                                              (variant . "high"))))))))))
+
+(ert-deftest test-opencode-client/session-create-omits-empty-selection ()
+  "Location-only creation still works when nothing is remembered."
+  (let ((conn (opencode-client-test--connection "/tmp/project/")))
+    (opencode-client-test--with-captured-request _url args
+      (opencode-client-session-create conn :success #'ignore :error #'ignore)
+      (should (equal (plist-get args :data)
+                     (json-encode '((location
+                                     . ((directory . "/tmp/project"))))))))))
+
+;;; model-default
+
+(ert-deftest test-opencode-client/model-default-gets-default ()
+  "The default model is fetched from the dedicated endpoint."
+  (let ((conn (opencode-client-test--connection "/tmp/project/")))
+    (opencode-client-test--with-captured-request url args
+      (opencode-client-model-default conn :success #'ignore :error #'ignore)
+      (should (equal url "http://127.0.0.1:4096/api/model/default"))
+      (should (equal (plist-get args :type) "GET")))))
+
 ;;; form-reply
 
 (ert-deftest test-opencode-client/form-reply-sends-answer ()

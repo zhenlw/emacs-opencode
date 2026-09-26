@@ -90,20 +90,27 @@ added (unless the caller already supplied one)."
    :success success
    :error error))
 
-(cl-defmethod opencode-client-session-create ((conn opencode-connection) &key success error)
+(cl-defmethod opencode-client-session-create ((conn opencode-connection) &key success error agent model)
   "Create a new session in CONN's directory.
 
 The server resolves the session location from the `location' object in
-the request body."
-  (opencode-request
-   conn
-   'POST
-   "/api/session"
-   :json (if-let* ((directory (opencode-connection-directory conn)))
-             `((location . ((directory . ,(directory-file-name directory)))))
-           (make-hash-table :test 'equal))
-   :success success
-   :error error))
+the request body.  AGENT names the session agent and MODEL is a
+`Model.Ref' alist as built by `opencode-client--model-ref'; both are
+included when provided so a new session is born selected, like the TUI."
+  (let ((body (if-let* ((directory (opencode-connection-directory conn)))
+                  `((location . ((directory . ,(directory-file-name directory)))))
+                '())))
+    (when (and (stringp agent) (not (string-empty-p agent)))
+      (setq body (append body (list (cons 'agent agent)))))
+    (when (and (consp model) (stringp (alist-get 'id model)))
+      (setq body (append body (list (cons 'model model)))))
+    (opencode-request
+     conn
+     'POST
+     "/api/session"
+     :json (if body body (make-hash-table :test 'equal))
+     :success success
+     :error error)))
 
 (cl-defmethod opencode-client-sessions ((conn opencode-connection) &key success error limit roots)
   "Fetch OpenCode sessions list.
@@ -208,6 +215,15 @@ MESSAGE-ID is nil, fork the whole session."
    conn
    'GET
    "/api/model"
+   :success success
+   :error error))
+
+(cl-defmethod opencode-client-model-default ((conn opencode-connection) &key success error)
+  "Fetch the default model CONN's server uses for unselected sessions."
+  (opencode-request
+   conn
+   'GET
+   "/api/model/default"
    :success success
    :error error))
 

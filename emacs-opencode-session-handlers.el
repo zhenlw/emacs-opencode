@@ -30,6 +30,7 @@
                   (agent))
 (declare-function opencode-session--agents-changed "emacs-opencode-session-model"
                   (connection))
+(declare-function opencode-session--fetch-default-model "emacs-opencode-session-model")
 
 (cl-defstruct (opencode-session--prompt-state
                (:constructor opencode-session--prompt-state-create))
@@ -1159,7 +1160,14 @@ Returns nil when PATH is not a string."
 
 (opencode-sse-define-handler model-updated "model.updated" (_event _data meta)
   (when-let* ((connection (plist-get meta :connection)))
-    (opencode-connection-providers-changed connection)))
+    (opencode-connection-providers-changed connection)
+    (maphash
+     (lambda (_session-id buffer)
+       (when (buffer-live-p buffer)
+         (with-current-buffer buffer
+           (when (eq opencode-session--connection connection)
+             (opencode-session--fetch-default-model)))))
+     opencode-session--buffers)))
 
 (opencode-sse-define-handler agent-updated "agent.updated" (_event _data meta)
   (when-let* ((connection (plist-get meta :connection)))

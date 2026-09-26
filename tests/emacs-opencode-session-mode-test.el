@@ -955,6 +955,38 @@ Leaves point on the tool summary line."
     (opencode-session-toggle-tool-output)
     (should-not (opencode-session--tool-drawer-open-p "p1"))))
 
+;;; session-info selection adoption
+
+(ert-deftest test-opencode-session-mode/update-session-adopts-info-selection ()
+  "Session info carrying agent/model seeds the server selection."
+  (with-temp-buffer
+    (opencode-session-mode)
+    (cl-letf (((symbol-function 'opencode-session--render-header) #'ignore)
+              ((symbol-function 'opencode-session--rename-buffer) #'ignore))
+      (opencode-session--update-session
+       '((id . "ses_1")
+         (agent . "build")
+         (model . ((id . "gemini-x") (providerID . "google")
+                   (variant . "default"))))))
+    (should (equal (opencode-session--current-model)
+                   '("google" . "gemini-x")))
+    (should (equal (opencode-session--current-variant) "default"))
+    (should (equal (opencode-session--current-agent) "build"))))
+
+(ert-deftest test-opencode-session-mode/update-session-null-info-keeps-selection ()
+  "Null info fields never clobber a recorded selection."
+  (with-temp-buffer
+    (opencode-session-mode)
+    (setq-local opencode-session--server-model
+                '((id . "picked") (providerID . "google")))
+    (setq-local opencode-session--server-agent "plan")
+    (cl-letf (((symbol-function 'opencode-session--render-header) #'ignore)
+              ((symbol-function 'opencode-session--rename-buffer) #'ignore))
+      (opencode-session--update-session '((id . "ses_1"))))
+    (should (equal (opencode-session--current-model)
+                   '("google" . "picked")))
+    (should (equal (opencode-session--current-agent) "plan"))))
+
 (provide 'emacs-opencode-session-mode-test)
 
 ;;; emacs-opencode-session-mode-test.el ends here

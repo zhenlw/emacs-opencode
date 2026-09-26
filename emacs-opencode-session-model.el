@@ -1,6 +1,7 @@
 ;;; emacs-opencode-session-model.el --- Agent, model, and variant selection  -*- lexical-binding: t; -*-
 
 (require 'cl-lib)
+(require 'seq)
 (require 'subr-x)
 (require 'emacs-opencode-session-vars)
 (require 'emacs-opencode-connection)
@@ -34,7 +35,157 @@ When nil, do not auto-select a model variant."
 
 (defvar opencode-session--recent-models nil
   "Global list of recently selected (PROVIDER-ID . MODEL-ID) pairs.
-Most recently selected first.")
+Most recently selected first.  This is an in-memory mirror of the
+`recent' list in the TUI's `model.json' preference file; the file is
+the source of truth and this cache is seeded from it.")
+
+(defvar opencode-session--favorite-models nil
+  "Global list of favorite (PROVIDER-ID . MODEL-ID) pairs.
+Mirrors the `favorite' list in the TUI's `model.json' preference file.")
+
+(defvar opencode-session--model-variant-map nil
+  "Alist mapping \"PROVIDER-ID/MODEL-ID\" strings to variant names.
+Mirrors the `variant' object in the TUI's `model.json' preference file.")
+
+(defvar opencode-session--preferences-loaded nil
+  "Non-nil once the model preference file has been read this session.")
+
+(defun opencode-session--preference-file ()
+  "Return the path of the TUI's `model.json' preference file.
+
+This lives under the XDG state directory, e.g.
+`~/.local/state/opencode/model.json', shared with the TUI and CLI so
+model recents, favorites, and per-model variants persist across all
+OpenCode clients."
+  (let ((state-home (or (getenv "XDG_STATE_HOME")
+                        (expand-file-name "~/.local/state"))))
+    (expand-file-name "opencode/model.json" state-home)))
+
+(defun opencode-session--preference-key (provider-id model-id)
+  "Return the preference-map key for PROVIDER-ID and MODEL-ID."
+  (format "%s/%s" provider-id model-id))
+
+(defun opencode-session--ensure-preferences ()
+  "Load model preferences from disk once, then return non-nil."
+  (unless opencode-session--preferences-loaded
+    (setq opencode-session--preferences-loaded t)
+    (opencode-session--load-preferences))
+  t)
+
+(defun opencode-session--load-preferences ()
+  "Seed recents, favorites, and variants from the TUI preference file."
+  (let ((file (opencode-session--preference-file)))
+    (when (file-readable-p file)
+      (condition-case nil
+          (with-temp-buffer
+            (insert-file-contents file)
+            (goto-char (point-min))
+            (let* ((data (json-parse-string
+                          (buffer-string)
+                          :object-type 'alist :array-type 'list
+                          :null-object nil :false-object nil))
+                   (pair (lambda (item)
+                           (let ((provider (alist-get 'providerID item))
+                                 (model (alist-get 'modelID item)))
+                             (and (stringp provider) (stringp model)
+                                  (cons provider model))))))
+              (setq opencode-session--recent-models
+                    (delq nil (mapcar pair (alist-get 'recent data))))
+              (setq opencode-session--favorite-models
+                    (delq nil (mapcar pair (alist-get 'favorite data))))
+              (setq opencode-session--model-variant-map nil)
+              (dolist (entry (alist-get 'variant data))
+                (when (and (consp entry) (stringp (cdr entry)))
+                  (let ((key (if (stringp (car entry))
+                                 (car entry)
+                               (symbol-name (car entry)))))
+                    (push (cons key (cdr entry))
+                          opencode-session--model-variant-map))))))
+        (error nil)))))
+
+(defun opencode-session--save-preferences ()
+  "Write recents, favorites, and variants back to the preference file.
+
+Uses an atomic rename and retries once when the file changed under us,
+so a concurrent TUI write is merged rather than clobbered."
+  (opencode-session--ensure-preferences)
+  (let ((file (opencode-session--preference-file))
+        (done nil))
+    (dotimes (_ 2 done)
+      (let ((mtime (and (file-exists-p file)
+                        (file-attribute-modification-time
+                         (file-attributes file)))))
+        (condition-case nil
+            (progn
+              (make-directory (file-name-directory file) t)
+              (let ((tmp (make-temp-file "opencode-model" nil ".json")))
+                (with-temp-file tmp
+                  (insert (json-encode
+                           `((recent . ,(mapcar
+                                         (lambda (key)
+                                           `((providerID . ,(car key))
+                                             (modelID . ,(cdr key))))
+                                         opencode-session--recent-models))
+                             (favorite . ,(mapcar
+                                           (lambda (key)
+                                             `((providerID . ,(car key))
+                                               (modelID . ,(cdr key))))
+                                           opencode-session--favorite-models))
+                             (variant . ,opencode-session--model-variant-map)))))
+                (if (or (null mtime)
+                        (not (file-exists-p file))
+                        (equal mtime (file-attribute-modification-time
+                                      (file-attributes file))))
+                    (progn (rename-file tmp file t) (setq done t))
+                  (delete-file tmp)
+                  (opencode-session--load-preferences))))
+          (error (setq done t)))))))
+
+(defun opencode-session--record-recent (provider-id model-id)
+  "Record PROVIDER-ID/MODEL-ID as most recently used and persist it."
+  (opencode-session--ensure-preferences)
+  (let ((key (cons provider-id model-id)))
+    (setq opencode-session--recent-models
+          (seq-take (cons key (cl-remove key opencode-session--recent-models
+                                         :test #'equal))
+                    10))
+    (opencode-session--save-preferences)))
+
+(defun opencode-session--record-variant (provider-id model-id variant)
+  "Remember VARIANT for PROVIDER-ID/MODEL-ID and persist it.
+A nil VARIANT clears the remembered mapping, matching the TUI's
+explicit \"default\" override."
+  (opencode-session--ensure-preferences)
+  (let ((key (opencode-session--preference-key provider-id model-id)))
+    (setq opencode-session--model-variant-map
+          (assoc-delete-all key opencode-session--model-variant-map))
+    (when (and (stringp variant) (not (string-empty-p variant)))
+      (push (cons key variant) opencode-session--model-variant-map))
+    (opencode-session--save-preferences)))
+
+(defun opencode-session--remembered-variant (provider-id model-id)
+  "Return the persisted variant for PROVIDER-ID/MODEL-ID, or nil."
+  (opencode-session--ensure-preferences)
+  (cdr (assoc (opencode-session--preference-key provider-id model-id)
+              opencode-session--model-variant-map)))
+
+(defun opencode-session--remembered-model ()
+  "Return the model to offer new sessions as (PROVIDER-ID . MODEL-ID).
+
+This is the most recent pick, so a fresh session starts where the
+user left off across all OpenCode clients.  Favorites only affect
+selector sorting; they are never auto-selected."
+  (opencode-session--ensure-preferences)
+  (car opencode-session--recent-models))
+
+(defun opencode-session--remembered-model-ref ()
+  "Return a `Model.Ref' alist for the remembered model, or nil.
+
+Includes the persisted variant when the remembered model has one."
+  (when-let* ((key (opencode-session--remembered-model)))
+    (opencode-client--model-ref
+     (cdr key) (car key)
+     (opencode-session--remembered-variant (car key) (cdr key)))))
 
 (defvar-local opencode-session--agent-index nil
   "Index of the server-selected agent in the available agents list.")
@@ -49,10 +200,11 @@ Most recently selected first.")
 ;; `POST /api/session/:id/model', records it in the message history as an
 ;; `agent-switched' or `model-switched' message, and broadcasts a
 ;; `session.agent.selected' or `session.model.selected' event.  The client
-;; keeps no authoritative copy of its own: it seeds the selection from the
-;; message history when a session loads and refreshes it from those events.
-;; `Session.Info' is deliberately unused -- its `agent' and `model' fields
-;; come back nil even for sessions that have run turns.
+;; keeps no authoritative copy of its own: it seeds the selection from
+;; `Session.Info' and the message history when a session loads, and
+;; refreshes it from those events.  (`Session.Info' is null for sessions
+;; that were never explicitly selected, even after turns have run -- the
+;; runner resolves the default lazily without writing it back.)
 
 (defun opencode-session--model-ref-p (ref)
   "Return non-nil when REF looks like a server `Model.Ref' alist."
@@ -162,6 +314,76 @@ Falls back to the agent of the newest assistant message and then to
          (index (and agent agents
                      (cl-position agent agents :test #'string=))))
     (setq-local opencode-session--agent-index index)))
+
+(defun opencode-session--default-ref-from-info (info)
+  "Return a `Model.Ref' alist extracted from default-model INFO.
+
+INFO is a `Model.Info' object (or its `{data: ...}' envelope) as
+returned by `GET /api/model/default'.  Returns nil when INFO names no
+usable model."
+  (let ((model (or (alist-get 'data info) info)))
+    (when (and (consp model)
+               (stringp (alist-get 'id model))
+               (stringp (alist-get 'providerID model)))
+      (let ((ref (list (cons 'id (alist-get 'id model))
+                       (cons 'providerID (alist-get 'providerID model)))))
+        (when-let* ((variant (alist-get 'variant model))
+                    ((stringp variant))
+                    ((not (string-empty-p variant))))
+          (setq ref (append ref (list (cons 'variant variant)))))
+        ref))))
+
+(defun opencode-session--resolve-initial-model ()
+  "Resolve the model to display for the current session buffer.
+
+Priority order: an already recorded selection wins; then the session's
+own info (a session born selected carries it); then the most recent
+model (which is also what new sessions are created with); the server
+default is the last resort and is only fetched when nothing else named
+a model.  Does nothing without a connection."
+  (when opencode-session--connection
+    (let ((switch (opencode-session--message-model-ref "model-switched"))
+          (info (and opencode-session--session
+                     (opencode-session-info opencode-session--session)))
+          (remembered (opencode-session--remembered-model-ref)))
+      (when-let* ((agent (alist-get 'agent info))
+                  ((stringp agent))
+                  ((null opencode-session--server-agent))
+                  ((null (opencode-session--message-agent "agent-switched"))))
+        (opencode-session--set-server-agent agent))
+      (let ((info-model (alist-get 'model info)))
+        (cond
+         ((or opencode-session--server-model switch)
+          nil)
+         ((opencode-session--model-ref-p info-model)
+          (opencode-session--set-server-model info-model)
+          (opencode-session--render-header))
+         ((opencode-session--model-ref-p remembered)
+          (opencode-session--set-server-model remembered)
+          (opencode-session--render-header))
+         (t
+          (let ((buffer (current-buffer))
+                (connection opencode-session--connection))
+            (opencode-client-model-default
+             connection
+             :success (lambda (&rest args)
+                        (when (buffer-live-p buffer)
+                          (with-current-buffer buffer
+                            (when (and (eq opencode-session--connection connection)
+                                       (null opencode-session--server-model)
+                                       (null (opencode-session--message-model-ref
+                                              "model-switched")))
+                              (when-let* ((ref (opencode-session--default-ref-from-info
+                                                (plist-get args :data))))
+                                (opencode-session--set-server-model ref)
+                                (opencode-session--render-header))))))
+             :error (lambda (&rest _args) nil)))))))))
+
+(defalias 'opencode-session--fetch-default-model
+  #'opencode-session--resolve-initial-model
+  "Fetch the server's default model for the current session buffer.
+Obsolete alias of `opencode-session--resolve-initial-model', which now
+prefers explicit, info, and remembered models first.")
 
 (defun opencode-session--failure-detail (args)
   "Return a parenthesized detail suffix for the failed request ARGS."
@@ -510,48 +732,58 @@ Each candidate is a plist with provider/model IDs and display text."
                       entries)))))))
     (opencode-session--sort-model-candidates entries)))
 
-(defun opencode-session--model-candidate-tier (candidate recent-models session-models)
+(defun opencode-session--model-candidate-tier (candidate favorites recent-models session-models)
   "Return the sort tier for CANDIDATE.
 
-RECENT-MODELS is the global recently-selected list.
-SESSION-MODELS is the list of models used in the current session.
-Tier 0 = recently selected, 1 = session-used, 2 = connected, 3 = other."
+FAVORITES is the global favorite list, RECENT-MODELS the global
+recently-selected list, and SESSION-MODELS the list of models used in
+the current session.  Tier 0 = favorite, 1 = recently selected,
+2 = session-used, 3 = connected, 4 = other."
   (let ((key (cons (plist-get candidate :provider-id)
                    (plist-get candidate :model-id))))
     (cond
-     ((member key recent-models) 0)
-     ((member key session-models) 1)
-     ((plist-get candidate :connected-p) 2)
-     (t 3))))
+     ((member key favorites) 0)
+     ((member key recent-models) 1)
+     ((member key session-models) 2)
+     ((plist-get candidate :connected-p) 3)
+     (t 4))))
 
 (defun opencode-session--model-candidate-rank (candidate tier ranked-list)
   "Return positional rank for CANDIDATE within TIER.
 
-RANKED-LIST is the ordered list for tiers 0 and 1."
-  (if (<= tier 1)
+RANKED-LIST is the ordered list for tiers 0 through 2."
+  (if (<= tier 2)
       (let ((key (cons (plist-get candidate :provider-id)
                        (plist-get candidate :model-id))))
         (or (cl-position key ranked-list :test #'equal) 0))
     0))
 
 (defun opencode-session--sort-model-candidates (entries)
-  "Sort ENTRIES by tier: recent, session-used, connected, other."
-  (let ((recent opencode-session--recent-models)
+  "Sort ENTRIES by tier: favorite, recent, session-used, connected, other."
+  (opencode-session--ensure-preferences)
+  (let ((favorites opencode-session--favorite-models)
+        (recent opencode-session--recent-models)
         (session (opencode-session--session-used-models)))
     (sort entries
           (lambda (a b)
-            (let* ((a-tier (opencode-session--model-candidate-tier a recent session))
-                   (b-tier (opencode-session--model-candidate-tier b recent session))
-                   (a-rank (opencode-session--model-candidate-rank a a-tier
-                            (if (= a-tier 0) recent session)))
-                   (b-rank (opencode-session--model-candidate-rank b b-tier
-                            (if (= b-tier 0) recent session))))
+            (let* ((a-tier (opencode-session--model-candidate-tier
+                            a favorites recent session))
+                   (b-tier (opencode-session--model-candidate-tier
+                            b favorites recent session))
+                   (rank-list (lambda (tier)
+                                (cond ((= tier 0) favorites)
+                                      ((= tier 1) recent)
+                                      (t session))))
+                   (a-rank (opencode-session--model-candidate-rank
+                            a a-tier (funcall rank-list a-tier)))
+                   (b-rank (opencode-session--model-candidate-rank
+                            b b-tier (funcall rank-list b-tier))))
               (cond
                ((< a-tier b-tier) t)
                ((> a-tier b-tier) nil)
                ((/= a-tier b-tier) nil)
-               ;; Within tiers 0 and 1, sort by positional rank
-               ((<= a-tier 1)
+               ;; Within tiers 0 through 2, sort by positional rank
+               ((<= a-tier 2)
                 (< a-rank b-rank))
                ;; Within tiers 2 and 3, sort alphabetically
                (t
@@ -590,9 +822,14 @@ The return value is a cons of (CHOICES . LOOKUP)."
    opencode-session--buffers))
 
 (defun opencode-session--variant-for-model (provider-id model-id)
-  "Return the active variant when MODEL-ID from PROVIDER-ID supports it.
-Returns nil when no variant is active or the model has no such variant."
-  (let ((variant (opencode-session--current-variant)))
+  "Return the variant to use when selecting MODEL-ID from PROVIDER-ID.
+
+Prefers the session's active variant, then the persisted per-model
+variant from the shared preference file.  Returns nil when neither is
+set or the model offers no such variant."
+  (let ((variant (or (opencode-session--current-variant)
+                     (opencode-session--remembered-variant
+                      provider-id model-id))))
     (when (and variant
                (cl-member variant (opencode-session--model-variants
                                    provider-id model-id)
@@ -602,18 +839,40 @@ Returns nil when no variant is active or the model has no such variant."
 (defun opencode-session--apply-model-selection (provider-id model-id)
   "Select MODEL-ID from PROVIDER-ID as the session model.
 
-Records the choice in the recent models list and asks the server to
-apply it; the server records the selection and confirms it with a
-`session.model.selected' event."
-  (let ((key (cons provider-id model-id)))
-    (setq opencode-session--recent-models
-          (cons key (cl-remove key opencode-session--recent-models
-                               :test #'equal))))
+Records the choice in the shared recent models list and asks the
+server to apply it; the server records the selection and confirms it
+with a `session.model.selected' event."
+  (opencode-session--record-recent provider-id model-id)
   (opencode-session--post-model
    model-id provider-id
    (opencode-session--variant-for-model provider-id model-id))
   (opencode-session--render-header)
   (message "OpenCode model: %s/%s" provider-id model-id))
+
+;;;###autoload
+(defun opencode-session-toggle-model-favorite ()
+  "Toggle the active model as a favorite.
+
+Favorites persist in the TUI's shared `model.json' preference file and
+sort first in the model selector, matching the TUI's `/models' dialog."
+  (interactive)
+  (unless (derived-mode-p 'opencode-session-mode)
+    (error "Not in an OpenCode session buffer"))
+  (let ((model (opencode-session--current-model)))
+    (unless model
+      (error "Select a model first"))
+    (opencode-session--ensure-preferences)
+    (if (member model opencode-session--favorite-models)
+        (progn
+          (setq opencode-session--favorite-models
+                (cl-remove model opencode-session--favorite-models :test #'equal))
+          (opencode-session--save-preferences)
+          (message "OpenCode: %s/%s removed from favorites"
+                   (car model) (cdr model)))
+      (push model opencode-session--favorite-models)
+      (opencode-session--save-preferences)
+      (message "OpenCode: %s/%s added to favorites"
+               (car model) (cdr model)))))
 
 (defun opencode-session--wait-for-load (ready-p on-ready &optional label)
   "Poll READY-P until non-nil, then call ON-READY with no arguments.
@@ -789,6 +1048,7 @@ confirms the selection."
     (unless model
       (error "Select a model first"))
     (setq-local opencode-session--variant-index (and variant index))
+    (opencode-session--record-variant (car model) (cdr model) variant)
     (opencode-session--post-model (cdr model) (car model) variant)
     (opencode-session--render-header)
     (message "OpenCode variant: %s" (or variant "none"))))
