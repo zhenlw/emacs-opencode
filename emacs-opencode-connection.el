@@ -285,6 +285,7 @@ updated CONNECTION."
                          "--port" (number-to-string port)))
          (buffer (get-buffer-create (format " *opencode-server<%s>*" default-directory)))
          (process (apply #'start-process "opencode-server" buffer command)))
+    (set-process-query-on-exit-flag process nil)
     (set-process-filter
      process
      (lambda (proc output)

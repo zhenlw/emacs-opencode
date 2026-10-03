@@ -320,13 +320,13 @@ message, fork the whole session."
                   (opencode-session--send-shell connection
                                                 opencode-session--session
                                                 (cdr classified))
-                  (opencode-session--clear-input)
+                  (opencode-session--commit-input)
                   (message "OpenCode shell command submitted"))
                  ('message
                   (opencode-session--send-input connection
                                                 opencode-session--session
                                                 input)
-                  (opencode-session--clear-input)
+                  (opencode-session--commit-input)
                   (message "OpenCode message submitted")))))))))))
 
 
@@ -482,6 +482,19 @@ message, fork the whole session."
     (insert input))
   (opencode-session--goto-input))
 
+(defun opencode-session--commit-input ()
+  "Commit the input region."
+  (let ((inhibit-read-only t))
+    (goto-char (marker-position opencode-session--input-start-marker))
+    (insert " **User** \n\n")
+    (goto-char (point-max))
+    (insert "\n\n **Opencode** \n\n")
+    ;(delete-region (marker-position opencode-session--input-start-marker)
+    ;               (point-max))
+    (set-marker opencode-session--input-marker (point-max))
+    (set-marker opencode-session--input-start-marker (point-max)))
+  (opencode-session--goto-input))
+
 ;;; Sending messages
 
 (defun opencode-session--extract-agent-mentions (input)
@@ -581,9 +594,9 @@ Falls back to a normal prompt when INPUT does not match an available command."
                              :error (lambda (&rest _args)
                                       (opencode-session--restore-input input)
                                       (message "OpenCode: failed to send command")))
-                            (opencode-session--clear-input))
+                            (opencode-session--commit-input))
                         (opencode-session--send-input connection session input)
-                        (opencode-session--clear-input)
+                        (opencode-session--commit-input)
                         (message "OpenCode message submitted"))))))
      :error (lambda (&rest _args)
               (error "Failed to fetch OpenCode commands")))))
