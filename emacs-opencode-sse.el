@@ -98,7 +98,7 @@ responses back to the correct OpenCode server.  V2 server frames
 nest the payload under `data'; it is exposed as `properties' here
 so handlers share one shape regardless of server version."
   (let ((handlers (alist-get event opencode-sse--handlers nil nil #'string=)))
-    (when handlers
+    (when (and handlers (listp data))
       (let ((payload (if (and (listp data)
                               (not (assq 'properties data))
                               (assq 'data data))
@@ -436,16 +436,18 @@ JSON lines to handlers."
                      (parsed (opencode-sse--bridge-parse-line line))
                      (parse-ms (opencode-sse-profile--elapsed-ms parse-start)))
                 (when parsed
+                  (when (listp parsed)
                   (let* ((event (alist-get 'type parsed))
                          (dispatch-start (opencode-sse-profile--now)))
                     (when event
                       (opencode-sse--dispatch event parsed (list :connection connection))
                       (let ((dispatch-ms (opencode-sse-profile--elapsed-ms dispatch-start)))
                         (opencode-sse-profile--record-finalize
-                         event parse-ms dispatch-ms (string-bytes line)))))))
-            (when-let* ((parsed (opencode-sse--bridge-parse-line line)))
-              (when-let* ((event (alist-get 'type parsed)))
-                (opencode-sse--dispatch event parsed (list :connection connection)))))
+                         event parse-ms dispatch-ms (string-bytes line))))))))
+            (when-let* ((parsed (opencode-sse--bridge-parse-line line))
+                        ((listp parsed))
+                        (event (alist-get 'type parsed)))
+                (opencode-sse--dispatch event parsed (list :connection connection))))
           (when chunk-start
             (opencode-sse-profile--record-chunk
              (opencode-sse-profile--elapsed-ms chunk-start)
